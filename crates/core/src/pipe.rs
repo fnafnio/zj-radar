@@ -101,33 +101,20 @@ const SELF_LIMITING_SEND: &str = concat!(
     "wait \"$p\" 2>/dev/null; s=$?; kill \"$w\" 2>/dev/null; exit \"$s\"",
 );
 
-/// Directories Git for Windows is known to install its bundled MSYS `sh.exe`
-/// under, relative to the Git install root (`bin` for the thin wrapper,
-/// `usr\bin` for the real MSYS tree). Neither is ever on `PATH` by default —
-/// only `Git\cmd` is — so `sh` alone fails to resolve on stock Windows even
-/// though nearly every Windows box capable of running `zellij pipe` also has
-/// Git for Windows installed (the same conclusion this repo's own dev
-/// machine hit: `sh` absent from `PATH`, present at both of these).
+/// Directories Git for Windows installs its bundled MSYS `sh.exe` under,
+/// relative to the Git install root. Neither is on `PATH` by default.
 const WINDOWS_GIT_SH_SUFFIXES: &[&str] = &["bin\\sh.exe", "usr\\bin\\sh.exe"];
 
-/// Environment variables that may hold a Git-for-Windows install root, in
-/// the order Windows itself would offer them: per-machine installs
-/// (`ProgramFiles`/`ProgramFiles(x86)`/`ProgramW6432`), then the common
-/// per-user install (`LocalAppData\Programs\Git`, `git-for-windows`'s
-/// per-user installer default — `LocalAppData` needs the extra `Programs\Git`
-/// segment, added in `resolve_sh` below since it is not a suffix shared with
-/// the per-machine roots).
+/// Env vars that may hold a Git-for-Windows install root: per-machine
+/// installs first, then the per-user root (handled separately in
+/// `resolve_sh` since it needs an extra `Programs\Git` segment).
 const WINDOWS_GIT_ROOT_VARS: &[&str] = &["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"];
 
-/// Pure candidate-path generation for the Windows fallback: given whatever
-/// Git-for-Windows install roots were found in the environment (per-machine
-/// `ProgramFiles`-family roots, and/or the per-user `LocalAppData\Programs`
-/// root, which carries one extra path segment the per-machine roots don't),
-/// produce the absolute `sh.exe` paths to probe, in priority order. Split out
-/// from `resolve_sh` (which owns the actual env/fs I/O) so the path-joining
-/// shape itself — right suffix, right per-user segment — is host-testable
-/// without mutating this process's real environment or faking a filesystem,
-/// matching this crate's "pure logic, host-testable" bar.
+/// Pure candidate-path generation for the Windows `sh` fallback: given
+/// whatever Git-for-Windows install roots were found in the environment,
+/// produce the absolute `sh.exe` paths to probe, in priority order. Split
+/// out from `resolve_sh` (which owns the env/fs I/O) so this is host-testable
+/// without touching the real environment or filesystem.
 fn windows_git_sh_candidates(
     machine_roots: &[&std::ffi::OsStr],
     local_app_data: Option<&std::ffi::OsStr>,
@@ -147,21 +134,11 @@ fn windows_git_sh_candidates(
 }
 
 /// Resolve the interpreter argv[0] for the self-limiting send. Unix hosts
-/// always have `sh` on `PATH`, so this is a same-string round trip there.
-/// On Windows, `sh` alone frequently is NOT resolvable (`zellij`/opencode's
-/// own launch environment rarely adds Git's `bin` dirs to `PATH`), which
-/// makes every status push silently fail to spawn — the producer never
-/// notices (`Command::spawn` erroring is handled the same as any other spawn
-/// failure), so the pane's pushed status just never arrives and the plugin's
-/// command-tracking fallback becomes the only thing left to show (the
-/// "sidebar shows `zj-radar notify` instead of the agent's status" bug).
-/// PATH is checked first — cheap, and honors a Unix host or a Windows user
-/// who added Git's `bin` themselves — before falling back to the well-known
-/// Git-for-Windows install roots (`windows_git_sh_candidates`). An absolute
-/// resolved path bypasses PATH search entirely, so it works even when the
-/// scan above finds nothing on PATH. If nothing is found anywhere, the bare
-/// name is returned unchanged: the same "not found" spawn failure as before,
-/// never a new failure mode.
+/// always have `sh` on `PATH`. On Windows, `sh` alone is often not
+/// resolvable even with Git for Windows installed, which would silently fail
+/// every status push. PATH is checked first, then the well-known
+/// Git-for-Windows install roots; if nothing is found, the bare name is
+/// returned unchanged (same "not found" spawn failure as before).
 fn resolve_sh() -> String {
     if let Some(paths) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&paths) {
@@ -186,11 +163,9 @@ fn resolve_sh() -> String {
 
 /// Argv for one self-limiting status broadcast: spawn it and the subtree
 /// guarantees its own exit within `timeout_secs` (plus scheduling slack),
-/// even if the spawner dies first. The script itself is POSIX `sh` — the
-/// same portability bar as every other host command this workspace spawns —
-/// but argv[0] is resolved rather than the bare literal `"sh"`, so a Windows
-/// host with Git for Windows installed but not on `PATH` (the common case)
-/// still finds an interpreter (`resolve_sh`).
+/// even if the spawner dies first. The script itself is POSIX `sh`, but
+/// argv[0] is resolved (`resolve_sh`) rather than the bare literal `"sh"` so
+/// a Windows host with Git for Windows but no `sh` on `PATH` still works.
 pub fn self_limiting_pipe_argv(payload: &str, timeout_secs: u64) -> Vec<String> {
     vec![
         resolve_sh(),
@@ -207,16 +182,10 @@ pub fn self_limiting_pipe_argv(payload: &str, timeout_secs: u64) -> Vec<String> 
 mod tests {
     use super::*;
 
-    /// Pure shape guard: a per-machine root (`ProgramFiles`-family) yields
-    /// both the `bin` and `usr\bin` candidates, joined under a `Git` segment.
-    /// Expected paths are built through the SAME `Path::join` calls as the
-    /// assertion's actual value (rather than a raw backslash literal) so the
-    /// test holds on every host this crate targets: `\` is a path separator
-    /// only on a Windows-target build (the one this fallback exists for);
-    /// elsewhere (this crate also builds for `wasm32-wasip1`) it is just
-    /// another character, so a literal `r"C:\Program Files\Git\bin\sh.exe"`
-    /// and the actual `.join()`-built value would silently diverge in
-    /// component count off this crate's own host.
+    /// A per-machine root yields both `bin` and `usr\bin` candidates under
+    /// `Git`. Expected paths are built with the same `Path::join` calls as
+    /// the actual value (not a raw backslash literal) so this holds on every
+    /// host this crate builds for, including non-Windows targets.
     #[test]
     fn windows_git_sh_candidates_covers_bin_and_usr_bin_per_machine_root() {
         let root = std::ffi::OsStr::new(r"C:\Program Files");
@@ -230,9 +199,7 @@ mod tests {
         );
     }
 
-    /// The per-user installer root carries one extra `Programs` segment the
-    /// per-machine roots don't — pinned separately so the two shapes can't
-    /// silently collapse into each other.
+    /// The per-user installer root carries one extra `Programs` segment.
     #[test]
     fn windows_git_sh_candidates_adds_the_per_user_programs_segment() {
         let local = std::ffi::OsStr::new(r"C:\Users\x\AppData\Local");
@@ -246,10 +213,8 @@ mod tests {
         );
     }
 
-    /// Multiple per-machine roots each contribute their own pair, in order —
-    /// `ProgramFiles` before `ProgramFiles(x86)` before `ProgramW6432`,
-    /// matching `resolve_sh`'s `WINDOWS_GIT_ROOT_VARS` order, plus the
-    /// per-user root last.
+    /// Multiple per-machine roots each contribute their own pair, in order,
+    /// with the per-user root last.
     #[test]
     fn windows_git_sh_candidates_orders_multiple_roots_machine_before_user() {
         let a = std::ffi::OsStr::new(r"C:\Program Files");
@@ -269,9 +234,7 @@ mod tests {
         );
     }
 
-    /// No roots at all (env vars absent, as in the wasm sandbox or a
-    /// stripped-down container) must yield no candidates, never a panic or a
-    /// bogus relative path.
+    /// No roots found must yield no candidates, never a panic.
     #[test]
     fn windows_git_sh_candidates_empty_when_no_roots_found() {
         assert!(windows_git_sh_candidates(&[], None).is_empty());
@@ -280,9 +243,8 @@ mod tests {
     #[test]
     fn argv_carries_payload_and_deadline_as_positionals() {
         let argv = self_limiting_pipe_argv(r#"{"v":1,"msg":"a b; $(rm)"}"#, 5);
-        // argv[0] is `resolve_sh()`'s pick — bare "sh" (PATH hit, the common
-        // Unix/CI case) or a resolved Windows Git-for-Windows absolute path
-        // ending `sh.exe` — this test only pins the POSITIONAL shape.
+        // argv[0] is `resolve_sh()`'s pick — bare "sh" or a resolved
+        // Windows `sh.exe` path — this test only pins the positional shape.
         assert!(argv[0] == "sh" || argv[0].ends_with("sh.exe"));
         assert_eq!(argv[1], "-c");
         // The payload rides verbatim as a positional parameter — never
@@ -308,11 +270,7 @@ mod tests {
 }
 
 /// Tests that spawn the argv for real against POSIX `sh` shims — gated to
-/// `unix` because the shims themselves are `#!/bin/sh` scripts marked
-/// executable via `PermissionsExt`, neither of which has a Windows
-/// equivalent. The pure, host-independent tests above (argv shape, the
-/// script text, Windows fallback path-joining) stay in the unconditional
-/// `tests` module.
+/// `unix` since the shims are executable `#!/bin/sh` scripts.
 #[cfg(all(test, unix))]
 mod unix_process_tests {
     use super::*;

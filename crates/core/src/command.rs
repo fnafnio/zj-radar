@@ -84,23 +84,11 @@ const IGNORE_NAMES: &[&str] = &[
 /// still surfaces a Running/Done lifecycle under their own `Kind`.
 pub const AGENT_NAMES: &[&str] = &["claude", "codex", "opencode"];
 
-/// The CLI's own binary. Its only foreground appearance in a tracked pane is
-/// the brief `zj-radar notify …` child a hook spawns to push an agent's
-/// status — never a command the user ran or wants surfaced. Defense in
-/// depth: the intended path is a fast, fire-and-forget spawn that never
-/// survives the `DEBOUNCE_TICKS` promotion window (`notify.rs`'s own send
-/// deadline is seconds, not the sub-second case), but a slow/contended send
-/// riding the pane's foreground for a couple of ticks — a wedged `zellij
-/// pipe`, a cold-cache `resolve_sh` fallback — must never win the debounce
-/// race and surface as a fake `Kind::Command` row reading literally
-/// `"zj-radar notify"`, stomping the real pushed status it exists to
-/// deliver. Kept out of `IGNORE_NAMES`: that list means "back at the shell
-/// prompt" and exit-clears a pushed status on match (`is_shell_prompt`) —
-/// `zj-radar` is neither a shell nor evidence the agent it just pushed for
-/// has quit, so it must not trip that clear. Kept out of `AGENT_NAMES` too:
-/// `is_agent_command` cancels the stale-Running grace clock on match, which
-/// only makes sense for the agent whose status IS the pane's identity, not
-/// its status-reporting helper.
+/// The CLI's own binary. A hook's `zj-radar notify …` child can briefly ride
+/// a pane's foreground while pushing a status; it must never surface as a
+/// fake `Kind::Command` row. Kept out of `IGNORE_NAMES` (not a shell, so it
+/// mustn't exit-clear a pushed status) and out of `AGENT_NAMES` (not the
+/// pane's agent identity, so it mustn't cancel the stale-Running grace clock).
 pub const SELF_NAME: &str = "zj-radar";
 
 /// Interactive programs — editors, pagers, monitors, git TUIs, file managers —
@@ -182,32 +170,18 @@ impl Default for CommandStore {
 
 /// Extract the basename from a path-like string (split on `/` or `\`, take
 /// last non-empty segment; empty string if input is empty). Both separators
-/// are recognized unconditionally (not gated on `cfg(windows)`) because the
-/// plugin always runs as `wasm32-wasip1`, regardless of the Zellij host OS:
-/// a Windows host can hand it a `C:\...` argv[0], and there is no reliable
-/// way to detect "host is Windows" from inside the wasm sandbox.
+/// are recognized unconditionally: the plugin is always wasm32-wasip1
+/// regardless of the Zellij host OS, so a Windows host can hand it a
+/// `C:\...` argv[0] with no reliable way to detect that from inside wasm.
 fn basename(s: &str) -> &str {
     s.rsplit(['/', '\\']).find(|seg| !seg.is_empty()).unwrap_or("")
 }
 
-/// Case-insensitive strip of a trailing Windows executable extension
-/// (`.exe`) from an already-deslashed program name. Zellij on Windows reports
-/// argv[0] with the extension (`opencode.exe`, `cargo.exe`, `pwsh.exe`), but
-/// every name vocabulary this module matches against — `IGNORE_NAMES`,
-/// `AGENT_NAMES`, `DEFAULT_INTERACTIVE`/`interactive_commands`, and
-/// `TOOL_RULES`' `exes` — is written extension-less, Unix-style. Without this,
-/// none of those lists ever match on Windows: a shell never reads as the
-/// prompt (breaking the agent exit-clear too), an agent's own exe is never
-/// recognized as agent-owned (the original Windows opencode bug — the pane
-/// falls back to ordinary command-tracking, which never clears because the
-/// TUI never returns to a shell prompt), and `cargo.exe test` never classifies
-/// as a Test run. Applied unconditionally, like `basename`'s backslash
-/// handling above: the plugin is wasm32-wasip1 regardless of host OS, so
-/// there is no `cfg(windows)` to gate on, and a Unix binary is vanishingly
-/// unlikely to be named literally `foo.exe`. Only `.exe` is stripped — the
-/// only extension Zellij's argv[0] carries for a native executable; `.cmd`/
-/// `.bat`/`.ps1` shims (`npm`, `yarn` on Windows) are a separate, unopened
-/// concern.
+/// Case-insensitive strip of a trailing `.exe` from an already-deslashed
+/// program name. Zellij on Windows reports argv[0] with the extension, but
+/// every name vocabulary this module matches against (`IGNORE_NAMES`,
+/// `AGENT_NAMES`, `DEFAULT_INTERACTIVE`, `TOOL_RULES`) is extension-less. Only
+/// `.exe` is stripped; `.cmd`/`.bat`/`.ps1` shims are a separate concern.
 fn strip_exe_suffix(s: &str) -> &str {
     if s.len() > 4 && s[s.len() - 4..].eq_ignore_ascii_case(".exe") {
         &s[..s.len() - 4]
@@ -217,13 +191,11 @@ fn strip_exe_suffix(s: &str) -> &str {
 }
 
 /// Basename with any login-shell `-` prefix and Windows `.exe` suffix
-/// stripped: a login shell's argv0 is reported as e.g. `-zsh`, which must
-/// still hit the shell/agent ignore sets, and a Windows argv0 is reported as
-/// e.g. `opencode.exe`, which must still hit `AGENT_NAMES`. Used for
-/// membership checks AND (via `classify`'s own `strip_exe_suffix` call on its
-/// `exe`) the display string — the two must agree, or the interactive sweep's
-/// `first_token(display) == program_name` invariant
-/// (`display_first_token_is_the_exe_basename`) breaks on every Windows name.
+/// stripped: a login shell's argv0 is reported as e.g. `-zsh`, and a Windows
+/// argv0 as e.g. `opencode.exe` — both must still hit the shell/agent ignore
+/// sets. Used for membership checks AND (via `classify`'s own
+/// `strip_exe_suffix` call) the display string, so the two stay in sync
+/// (`display_first_token_is_the_exe_basename`).
 fn program_name(s: &str) -> &str {
     strip_exe_suffix(basename(s).trim_start_matches('-'))
 }
@@ -477,13 +449,9 @@ fn classify(command: &[String]) -> (String, Kind) {
     let Some(first) = command.first() else {
         return (String::new(), Kind::Command);
     };
-    // Strip a Windows `.exe` suffix here too (not just in `program_name`):
-    // this `exe` is both the vocabulary key (agent identity, `TOOL_RULES`,
-    // `is_python_interpreter`) AND the display's leading token, and the two
-    // must stay equal — see `program_name`'s doc comment and the
-    // `display_first_token_is_the_exe_basename` guard test. `cargo.exe test`
-    // now classifies as `Kind::Test` and displays as `cargo test`, matching
-    // the Unix `cargo test` a Windows user's teammates see.
+    // Strip `.exe` here too (not just in `program_name`): `exe` is both the
+    // vocabulary key and the display's leading token, and the two must stay
+    // equal (`display_first_token_is_the_exe_basename`).
     let exe = strip_exe_suffix(basename(first));
     let args = &command[1..];
 
@@ -601,12 +569,8 @@ impl CommandStore {
         // Peel env-prefixes/wrappers once at intake so the ignore check, the
         // display string, and the Kind all classify the real command.
         let (command, name) = effective_program(command);
-        // Shells, agents, and the CLI's own transient status-push child are
-        // all "not a real command we track here": shells mean
-        // back-to-the-prompt; agents are owned by the push pipe (see
-        // AGENT_NAMES); `zj-radar` itself is the push pipe's own producer
-        // (see SELF_NAME) — never a command whose lifecycle belongs on the
-        // rail. Either way we never open a command lifecycle for them.
+        // Shells, agents, and zj-radar's own status-push child are all "not
+        // a real command we track here" — never open a lifecycle for them.
         let in_ignore_set =
             IGNORE_NAMES.contains(&name) || AGENT_NAMES.contains(&name) || name == SELF_NAME;
         let interactive = self.interactive.contains(name);
@@ -1006,11 +970,8 @@ impl CommandStore {
     /// `display_first_token_is_the_exe_basename`). Returns whether anything
     /// observable changed (the caller's render/persist trigger).
     pub fn set_interactive_extras<'a>(&mut self, extras: impl IntoIterator<Item = &'a str>) -> bool {
-        // Strip a Windows `.exe` suffix off every entry (defaults included —
-        // a no-op for them) so a user's `interactive_commands "k9s.exe"`
-        // matches the same peeled `program_name`/`classify` key an entry
-        // written as bare `k9s` does; the two spellings must be
-        // interchangeable, mirroring `AGENT_NAMES`/`IGNORE_NAMES` above.
+        // Strip `.exe` off every entry so `interactive_commands "k9s.exe"`
+        // matches the same key a bare `k9s` entry does.
         self.interactive = DEFAULT_INTERACTIVE
             .iter()
             .copied()
