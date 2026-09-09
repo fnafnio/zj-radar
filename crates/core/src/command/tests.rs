@@ -40,6 +40,12 @@
         // there is no binary named e.g. `-nu` in practice, but a real command
         // with a dashed basename stays a command.
         assert!(!is_shell_prompt(&argv(&["my-tool"])));
+        // Windows reports the shell's own argv0 with a `.exe` suffix: a
+        // Nushell/PowerShell pane must exit-clear a finished agent's pushed
+        // status exactly like its Unix counterpart, or Windows Nushell users
+        // uniquely lose that behavior.
+        assert!(is_shell_prompt(&argv(&["nu.exe"])));
+        assert!(is_shell_prompt(&argv(&["pwsh.exe"])));
     }
 
     #[test]
@@ -600,6 +606,138 @@
         assert_eq!(s.repo, "myproject", "repo must be basename of cwd");
     }
 
+    #[test]
+    fn windows_backslash_argv0_path_basename_used_for_command_and_repo() {
+        let mut store = CommandStore::default();
+        // Absolute Windows path, backslash-separated (e.g. a scoop shim or
+        // Program Files install), for a host Zellij running natively on
+        // Windows while the plugin itself is wasm32-wasip1. `cargo`, not
+        // `nu`: nu is itself a shell (`IGNORE_NAMES`), so a `nu.exe` argv0
+        // here would collide with the exe-suffix-stripped shell check below
+        // and never open a command lifecycle at all — a real, correct
+        // interaction (a Windows Nushell pane's own prompt must exit-clear a
+        // finished agent just like any other shell's), just the wrong choice
+        // of stand-in for "an arbitrary Windows tool".
+        let cmd = vec![
+            "C:\\Users\\fpungg\\scoop\\shims\\cargo.exe".to_string(),
+            "build".to_string(),
+        ];
+
+        store.on_command_changed(1, &cmd, true, Some("C:\\LocalFiles\\myproject"), 1);
+        store.on_timer(Tick(1 + DEBOUNCE_TICKS), EpochSecs(0));
+        let s = store.get(1).expect("must be Running");
+        assert_eq!(
+            s.msg, "cargo build",
+            "basename of backslash-separated Windows path must be used, \
+             with the .exe suffix stripped like the Unix `cargo` a teammate sees"
+        );
+        assert_eq!(s.kind, Kind::Build);
+        assert_eq!(
+            s.repo, "myproject",
+            "repo must be basename of backslash-separated cwd"
+        );
+    }
+
+    #[test]
+    fn strip_exe_suffix_is_case_insensitive_and_conservative() {
+        // Every casing Windows might hand back.
+        assert_eq!(strip_exe_suffix("cargo.exe"), "cargo");
+        assert_eq!(strip_exe_suffix("cargo.EXE"), "cargo");
+        assert_eq!(strip_exe_suffix("cargo.Exe"), "cargo");
+        // Bare Unix names, and names that merely contain "exe", are untouched.
+        assert_eq!(strip_exe_suffix("cargo"), "cargo");
+        assert_eq!(strip_exe_suffix("execute"), "execute");
+        assert_eq!(strip_exe_suffix("my.exec"), "my.exec");
+        // A name that IS just ".exe" (no basename left after stripping) is
+        // left alone rather than collapsed to empty.
+        assert_eq!(strip_exe_suffix(".exe"), ".exe");
+        assert_eq!(strip_exe_suffix(""), "");
+        // Only the trailing suffix is stripped, once.
+        assert_eq!(strip_exe_suffix("test.exe.exe"), "test.exe");
+    }
+
+    #[test]
+    fn windows_exe_suffix_stripped_before_shell_and_agent_membership_checks() {
+        // Zellij on Windows reports argv[0] with the extension; every
+        // membership list here is written extension-less, so without the
+        // strip none of these ever matched — the original Windows opencode
+        // bug (AGENT_NAMES) plus its shell-prompt sibling.
+        for shell in ["pwsh.exe", "bash.exe"] {
+            assert!(is_shell_prompt(&argv(&[shell])), "{shell} is a prompt");
+        }
+        for agent in ["claude.exe", "codex.exe", "opencode.exe"] {
+            assert!(is_agent_command(&argv(&[agent])), "{agent} is an agent");
+        }
+        // Case-insensitive extension, case-SENSITIVE base name (matching
+        // `Kind::from_source`'s deliberate case-sensitivity, pinned by
+        // `from_source_unknown_is_other`): only the `.exe` casing is lenient.
+        assert!(is_agent_command(&argv(&["opencode.EXE"])));
+        assert!(is_agent_command(&argv(&["codex.Exe"])));
+        assert!(is_shell_prompt(&argv(&["pwsh.EXE"])));
+        // A login-shell dash and a Windows extension can both be present.
+        assert!(is_shell_prompt(&argv(&["-pwsh.exe"])));
+        // An ordinary command with a `.exe` suffix is still just a command.
+        assert!(!is_shell_prompt(&argv(&["cargo.exe"])));
+        assert!(!is_agent_command(&argv(&["nvim.exe"])));
+    }
+
+    #[test]
+    fn windows_exe_suffixed_agents_leave_no_command_store_trace() {
+        // End-to-end sibling of `agent_foreground_commands_are_not_tracked`:
+        // without the strip, `opencode.exe` fell through AGENT_NAMES and was
+        // command-tracked as an ordinary foreground process — one that never
+        // returns to a shell prompt, so the row stuck Running forever no
+        // matter what the push pipe said (the reported bug).
+        for agent in &["claude.exe", "codex.exe", "opencode.exe"] {
+            let mut store = CommandStore::default();
+            store.on_command_changed(1, &[agent.to_string()], true, Some("/work/repo"), 1);
+            assert!(
+                !store.pending.contains_key(&1),
+                "{agent} must not enter pending"
+            );
+            store.on_timer(Tick(2), EpochSecs(0));
+            assert!(
+                store.get(1).is_none(),
+                "{agent} must leave no resolved command state"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_exe_suffixed_tools_classify_and_display_without_the_extension() {
+        // TOOL_RULES/python-interpreter/agent-identity lookups inside
+        // `classify` all key on the same stripped name the display uses, so
+        // `cargo.exe test` reads and classifies exactly like Unix's
+        // `cargo test` — no `.exe` clutter on the rail, and the row still
+        // earns its `Kind::Test`/etc. mark.
+        let cases: &[(&[&str], &str, Kind)] = &[
+            (&["cargo.exe", "test", "core"], "cargo test core", Kind::Test),
+            (&["cargo.EXE", "build"], "cargo build", Kind::Build),
+            (&["python.exe", "-m", "pytest", "-q", "t.py"], "python -m pytest t.py", Kind::Test),
+            (&["npm.exe", "run", "build"], "npm run build", Kind::Build),
+            // Gemini has no push adapter, so it is command-tracked (not
+            // suppressed) even on Windows — it must still carry its own Kind.
+            (&["gemini.exe", "chat"], "gemini", Kind::Gemini),
+        ];
+        for (cmd, want_display, want_kind) in cases {
+            let (display, kind) = classify(&argv(cmd));
+            assert_eq!(kind, *want_kind, "kind for {cmd:?}");
+            assert_eq!(&display, want_display, "display for {cmd:?}");
+        }
+    }
+
+    #[test]
+    fn windows_exe_extension_on_an_interactive_extra_matches_either_spelling() {
+        // A Windows user copying a process name out of Task Manager writes
+        // `k9s.exe`; one copied from these docs writes bare `k9s`. Both must
+        // demote/quiet the row identically, and match a `k9s.exe` argv too.
+        let mut s = CommandStore::default();
+        s.set_interactive_extras(["k9s.exe"]);
+        s.on_command_changed(1, &argv(&["k9s.exe"]), true, None, 0);
+        assert!(s.get(1).is_none(), "must never promote to Running");
+        assert_eq!(s.quiet_identity(1), Some(("k9s", Kind::Command)));
+    }
+
     // ── Test 7: prune drops dead panes from all maps
 
     #[test]
@@ -773,6 +911,47 @@
                 "{agent} must leave no resolved command state"
             );
         }
+    }
+
+    #[test]
+    fn zj_radar_own_notify_child_is_not_tracked() {
+        // The CLI's transient `zj-radar notify opencode --status running …`
+        // child, briefly visible as the pane's foreground command while it
+        // pushes a status, must leave NO command-store trace — otherwise a
+        // slow/contended send (a wedged `zellij pipe`, a cold `resolve_sh`
+        // fallback) can survive the debounce window and surface a fake
+        // `Kind::Command` row reading literally "zj-radar notify", stomping
+        // the real pushed status it exists to deliver (the reported bug).
+        let mut store = CommandStore::default();
+        store.on_command_changed(
+            1,
+            &["zj-radar".to_string(), "notify".to_string(), "opencode".to_string(), "--status".to_string(), "running".to_string()],
+            true,
+            Some("/work/repo"),
+            1,
+        );
+        assert!(!store.pending.contains_key(&1), "zj-radar must not enter pending");
+        store.on_timer(Tick(1 + DEBOUNCE_TICKS), EpochSecs(0));
+        assert!(store.get(1).is_none(), "zj-radar must leave no resolved command state");
+    }
+
+    #[test]
+    fn zj_radar_own_notify_child_is_not_tracked_with_windows_exe_suffix() {
+        // Mirrors `windows_exe_suffixed_agents_leave_no_command_store_trace`:
+        // Zellij on Windows reports argv[0] with the `.exe` extension, so
+        // SELF_NAME's own membership check must peel it the same way
+        // AGENT_NAMES/IGNORE_NAMES do (`effective_program`/`program_name`).
+        let mut store = CommandStore::default();
+        store.on_command_changed(
+            1,
+            &["zj-radar.exe".to_string(), "notify".to_string(), "opencode".to_string()],
+            true,
+            Some("/work/repo"),
+            1,
+        );
+        assert!(!store.pending.contains_key(&1), "zj-radar.exe must not enter pending");
+        store.on_timer(Tick(1 + DEBOUNCE_TICKS), EpochSecs(0));
+        assert!(store.get(1).is_none(), "zj-radar.exe must leave no resolved command state");
     }
 
     #[test]
@@ -1127,9 +1306,17 @@
                 !AGENT_NAMES.contains(name),
                 "{name} must not double as a push-agent name"
             );
+            assert_ne!(*name, SELF_NAME, "{name} must not double as the CLI's own name");
         }
+        // SELF_NAME carries its own fourth contract (see its doc comment) and
+        // must not collide with the other two membership lists either —
+        // `zj-radar` reading as a shell prompt would exit-clear a pushed
+        // status on its own transient notify child; reading as an agent
+        // would (wrongly) cancel the stale-Running grace clock off it.
+        assert!(!IGNORE_NAMES.contains(&SELF_NAME), "SELF_NAME must not double as a shell-prompt name");
+        assert!(!AGENT_NAMES.contains(&SELF_NAME), "SELF_NAME must not double as a push-agent name");
         // WRAPPERS is a different animal (a transparency list, not a
-        // classification role) but must stay disjoint from ALL THREE
+        // classification role) but must stay disjoint from ALL FOUR
         // membership lists: `effective_program` peels a wrapper away before
         // any membership check runs, so a name in both would be silently
         // invisible to its other list (a wrapped-away "interactive" name
@@ -1138,7 +1325,8 @@
             assert!(
                 !IGNORE_NAMES.contains(name)
                     && !AGENT_NAMES.contains(name)
-                    && !DEFAULT_INTERACTIVE.contains(name),
+                    && !DEFAULT_INTERACTIVE.contains(name)
+                    && *name != SELF_NAME,
                 "{name} is peeled by effective_program — membership lists would never see it"
             );
         }
