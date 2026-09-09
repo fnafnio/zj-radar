@@ -64,6 +64,13 @@
       };
       commonArgs = {
         inherit src;
+        # The root Cargo.toml is a virtual workspace (no `[package]`), so crane
+        # cannot infer a crate name from it and would fall back to the
+        # placeholder `cargo-package`, warning once per derivation. `version`
+        # still comes from `[workspace.package]`. The wasm dependency set and
+        # the CLI override this below so every derivation in the graph carries
+        # a distinct, meaningful name.
+        pname = "zj-radar";
         strictDeps = true;
         # zellij-tile's dependency tree pulls openssl-sys (via isahc → curl);
         # its build script needs openssl + pkg-config present. Shared via
@@ -83,7 +90,9 @@
           cargoExtraArgs = "-p zj-radar-plugin";
           doCheck = false; # wasm can't execute on the host builder; see `checks` for tests
         };
-      cargoArtifactsWasm = craneLib.buildDepsOnly wasmArgs;
+      # Named apart from the host deps (`zj-radar-deps`): same crate set, but a
+      # different target, so a different derivation.
+      cargoArtifactsWasm = craneLib.buildDepsOnly (wasmArgs // {pname = "zj-radar-wasm";});
       zj-radar = craneLib.buildPackage (wasmArgs
         // {
           cargoArtifacts = cargoArtifactsWasm;
@@ -125,13 +134,19 @@
       cliArgs =
         commonArgs
         // {
+          pname = "zj-radar-cli";
           cargoExtraArgs = "-p zj-radar";
           ZJ_RADAR_WASM_PATH = "${zj-radar}/bin/zj_radar.wasm";
         };
-      cargoArtifactsCli = craneLib.buildDepsOnly (commonArgs // {cargoExtraArgs = "-p zj-radar";});
-      zj-radar-cli = craneLib.buildPackage (cliArgs
+      # Not `cliArgs`: that carries ZJ_RADAR_WASM_PATH, which would make the
+      # CLI's dependency build rerun whenever the wasm changes.
+      cargoArtifactsCli = craneLib.buildDepsOnly (commonArgs
         // {
           pname = "zj-radar-cli";
+          cargoExtraArgs = "-p zj-radar";
+        });
+      zj-radar-cli = craneLib.buildPackage (cliArgs
+        // {
           cargoArtifacts = cargoArtifactsCli;
           cargoExtraArgs = "--bin zj-radar";
           doCheck = false;
