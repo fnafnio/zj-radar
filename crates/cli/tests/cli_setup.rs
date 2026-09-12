@@ -1692,12 +1692,17 @@ fn isolated_opencode_xdg() -> (TempDir, std::path::PathBuf) {
 }
 
 fn opencode_cmd(xdg: &TempDir, args: &[&str]) -> assert_cmd::assert::Assert {
+    // Scrub PATH like `setup_claude_skips_when_binary_missing` does: a real
+    // `opencode` (or `zj-radar`) on the host PATH would flip check_opencode's
+    // binary items from Missing to Ok, which these tests assume won't happen.
+    let empty_path = TempDir::new().unwrap();
     Command::cargo_bin("zj-radar")
         .unwrap()
         .args(["setup", "opencode"])
         .args(args)
         .env("XDG_CONFIG_HOME", xdg.path())
         .env("HOME", xdg.path())
+        .env("PATH", empty_path.path())
         .assert()
 }
 
