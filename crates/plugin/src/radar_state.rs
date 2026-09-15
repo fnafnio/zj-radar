@@ -553,9 +553,19 @@ impl RadarState {
         // them from its own first PaneUpdate rather than the snapshot.
         let mut displaced_any = false;
         for (pane_id, exit_status) in update.exits {
+            // Captured BEFORE `on_exit` mutates: a Running remote session
+            // ending is the disconnect edge the tab flash announces — see
+            // `arm_flash`'s doc.
+            let was_remote_running = self
+                .command
+                .get(pane_id)
+                .is_some_and(|o| o.kind.is_remote() && o.status == Status::Running);
             if let Some(displaced) = self.command.on_exit(pane_id, exit_status, Tick(tick), EpochSecs(now_epoch_s)) {
                 self.ledger_receded(vec![(pane_id, displaced)], &old_index, &status_tracked);
                 displaced_any = true;
+            }
+            if was_remote_running {
+                self.arm_flash(pane_id, tick);
             }
             // A dead pane root is definitive producer death for the pushed
             // status too — the agent-rooted pane (`zellij run -- claude`)
@@ -652,6 +662,13 @@ impl RadarState {
         // captures IS the "at this moment" set — see `resolve`'s precedence
         // and `status_tracked_pane_ids`'s doc.
         self.ledger_recede_now(report.receded);
+        // A remote session's Running→Done confirm is the disconnect edge the
+        // tab flash announces — see `arm_flash`'s doc.
+        for (pane_id, kind) in report.completed {
+            if kind.is_remote() {
+                self.arm_flash(pane_id, tick);
+            }
+        }
         // Stale-Running expiry: an agent killed mid-turn sends no clearing
         // broadcast; its prompt-return grace clock (see `clear_on_prompt_return`)
         // runs out here. Running is not a completion — nothing to ledger — but
@@ -784,9 +801,7 @@ impl RadarState {
         let now_status = self.status.get(pane_id).map(|o| o.status);
         self.touch();
         if flips_to_pending {
-            if let Some((tab_id, _)) = self.pane_tab_index().get(&pane_id) {
-                self.flash_until.insert(*tab_id, tick + FLASH_TICKS);
-            }
+            self.arm_flash(pane_id, tick);
         }
         // A Running→Running update (new activity label / task / repo, same
         // status) is the tool-hook firehose's steady state. The Fast (1 Hz)
@@ -857,6 +872,23 @@ impl RadarState {
         changed
     }
 
+    /// Apply the user's `remote_commands` extras to the command store
+    /// (level-triggered — see `CommandStore::set_remote_extras`). Called after
+    /// snapshot load and on every `config.v1` override, mirroring
+    /// `set_interactive_commands`. Returns whether observable state changed.
+    pub(crate) fn set_remote_commands(
+        &mut self,
+        extras: &std::collections::BTreeSet<String>,
+    ) -> bool {
+        let changed = self
+            .command
+            .set_remote_extras(extras.iter().map(String::as_str));
+        if changed {
+            self.touch();
+        }
+        changed
+    }
+
     /// True while a command-origin `Done` is still inside its `DONE_TTL_TICKS`
     /// window, awaiting the recede to Idle. Delegates to
     /// `CommandStore::has_done_awaiting_recede` — see `needs_fast_ticks`'s doc
@@ -887,11 +919,20 @@ impl RadarState {
         let (Some(pane), Some(own)) = (pane, self.naming_tab_id) else {
             return true;
         };
-        let holds = |position: usize| self.tab_panes.get(&position).is_some_and(|panes| panes.iter().any(|p| p.id == pane));
-        match self.tabs.iter().find(|t| holds(t.position)) {
-            Some(tab) => tab.id == own,
-            None => true,
-        }
+        self.tab_of_pane(pane).is_none_or(|tab_id| tab_id == own)
+    }
+
+    /// The tab currently seating `pane_id`, by the `tabs × tab_panes` position
+    /// join — a single-tab lookup with no allocation, for edge paths;
+    /// `pane_tab_index` is the same join materialized for whole-topology
+    /// captures. `None` when the pane is in no tab (mid break-pane, or gone).
+    fn tab_of_pane(&self, pane_id: u32) -> Option<TabId> {
+        self.tabs.iter().find_map(|tab| {
+            self.tab_panes
+                .get(&tab.position)
+                .is_some_and(|panes| panes.iter().any(|p| p.id == pane_id))
+                .then_some(tab.id)
+        })
     }
 
     /// Track the focused terminal pane, for the notifier's "don't ding the pane
@@ -991,6 +1032,17 @@ impl RadarState {
     /// `RenderOpts` is built.
     pub(crate) fn ledger_is_empty(&self) -> bool {
         self.ledger.is_empty()
+    }
+
+    /// Arm the tab-level ping flash for the tab holding `pane_id`, if it is
+    /// still seated in one. Shared by `status_pipe`'s live not-Pending →
+    /// Pending edge and a Running-remote → completion edge (`timer`,
+    /// `panes_changed`'s exit handling) — both are "make the user aware"
+    /// edges that fire whether or not a desktop notification also does.
+    fn arm_flash(&mut self, pane_id: u32, tick: u64) {
+        if let Some(tab_id) = self.tab_of_pane(pane_id) {
+            self.flash_until.insert(tab_id, tick + FLASH_TICKS);
+        }
     }
 
     /// Pane → (tab id, tab name) for every pane currently in `self.tab_panes`,

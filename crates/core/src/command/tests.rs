@@ -99,6 +99,58 @@
         assert_eq!(display(&argv(&["sleep", "5"])), "sleep 5");
     }
 
+    #[test]
+    fn display_remote_parses_ssh_argv_shapes() {
+        // Separated value option consumes the next token…
+        assert_eq!(display(&argv(&["ssh", "-p", "2222", "prod-db"])), "ssh prod-db");
+        // …but the attached forms (short value baked in, `-o` long-option-value)
+        // do not — this is exactly the shape `first_non_option` gets wrong.
+        assert_eq!(display(&argv(&["ssh", "-p2222", "prod-db"])), "ssh prod-db");
+        assert_eq!(display(&argv(&["ssh", "-oProxyJump=x", "prod-db"])), "ssh prod-db");
+        // user@host is stripped to the host.
+        assert_eq!(display(&argv(&["ssh", "user@prod-db"])), "ssh prod-db");
+        // -J takes a separated value (the jump host), not the destination.
+        assert_eq!(display(&argv(&["ssh", "-J", "jump", "prod-db"])), "ssh prod-db");
+        // ssh:// URI form keeps only the host.
+        assert_eq!(
+            display(&argv(&["ssh", "ssh://user@prod-db:2222/"])),
+            "ssh prod-db"
+        );
+        // A `-N -L` tunnel has no destination-following command — still Remote.
+        assert_eq!(
+            classify(&argv(&["ssh", "-N", "-L", "8080:localhost:80", "prod-db"])).1,
+            Kind::Remote
+        );
+        // Bare ssh / flags-only ssh has no destination at all → ordinary command.
+        assert_eq!(display(&argv(&["ssh"])), "ssh");
+        assert_eq!(classify(&argv(&["ssh"])).1, Kind::Command);
+        assert_eq!(display(&argv(&["ssh", "-V"])), "ssh");
+        assert_eq!(classify(&argv(&["ssh", "-V"])).1, Kind::Command);
+        // mosh long options taking a separated value are skipped like ssh's.
+        assert_eq!(
+            display(&argv(&["mosh", "--predict", "adaptive", "prod-db"])),
+            "mosh prod-db"
+        );
+        // `mosh-client <ip> <port>`: the port is never a trailing remote command.
+        assert_eq!(display(&argv(&["mosh-client", "1.2.3.4", "60001"])), "mosh-client 1.2.3.4");
+        assert_eq!(classify(&argv(&["mosh-client", "1.2.3.4", "60001"])).1, Kind::Remote);
+    }
+
+    #[test]
+    fn classify_routes_remote_launchers_by_trailing_command() {
+        // A bare session (no remote command) is the Remote class.
+        assert_eq!(classify(&argv(&["ssh", "box"])).1, Kind::Remote);
+        // A trailing remote command is bounded work — a Job, still Kind::Command.
+        assert_eq!(
+            classify(&argv(&["ssh", "box", "cargo", "build"])).1,
+            Kind::Command
+        );
+        assert_eq!(
+            display(&argv(&["ssh", "box", "cargo", "build"])),
+            "ssh box"
+        );
+    }
+
     /// Pin the display half of `classify` across every branch of the table-driven
     /// model: each `ToolRule` shape (`subcommands: Some` known-sub lookup vs
     /// `None` first-arg), in/out of `target_verbs`, the `FIRST_ARG_RULE`
@@ -210,6 +262,8 @@
             (argv(&["npm", "run", "test-watch"]), "npm run test-watch", Kind::Test),
             // Anything unrecognized is a plain command.
             (argv(&["sleep", "5"]), "sleep 5", Kind::Command),
+            // A bare remote session (no trailing command) is the Remote class.
+            (argv(&["ssh", "prod-db"]), "ssh prod-db", Kind::Remote),
         ]
     }
 
@@ -1115,10 +1169,25 @@
 
     #[test]
     fn interactive_set_disjoint_from_prompt_and_agent_names() {
-        // The three name lists carry three DIFFERENT contracts (prompt /
-        // push-owned / quiet), and a name drifting into two of them silently
-        // re-creates the "opened nvim reads as returned-to-shell" trap.
+        // The four name lists carry four DIFFERENT contracts (prompt /
+        // push-owned / quiet / remote), and a name drifting into two of them
+        // silently re-creates the "opened nvim reads as returned-to-shell"
+        // trap (issue #13).
         for name in DEFAULT_INTERACTIVE {
+            assert!(
+                !IGNORE_NAMES.contains(name),
+                "{name} must not double as a shell-prompt name"
+            );
+            assert!(
+                !AGENT_NAMES.contains(name),
+                "{name} must not double as a push-agent name"
+            );
+            assert!(
+                !DEFAULT_REMOTE.contains(name),
+                "{name} must not double as a remote-session launcher"
+            );
+        }
+        for name in DEFAULT_REMOTE {
             assert!(
                 !IGNORE_NAMES.contains(name),
                 "{name} must not double as a shell-prompt name"
@@ -1129,7 +1198,7 @@
             );
         }
         // WRAPPERS is a different animal (a transparency list, not a
-        // classification role) but must stay disjoint from ALL THREE
+        // classification role) but must stay disjoint from ALL FOUR
         // membership lists: `effective_program` peels a wrapper away before
         // any membership check runs, so a name in both would be silently
         // invisible to its other list (a wrapped-away "interactive" name
@@ -1138,7 +1207,8 @@
             assert!(
                 !IGNORE_NAMES.contains(name)
                     && !AGENT_NAMES.contains(name)
-                    && !DEFAULT_INTERACTIVE.contains(name),
+                    && !DEFAULT_INTERACTIVE.contains(name)
+                    && !DEFAULT_REMOTE.contains(name),
                 "{name} is peeled by effective_program — membership lists would never see it"
             );
         }
@@ -1339,6 +1409,178 @@
         assert!(changed, "pending flipped promotable");
         s.on_timer(Tick(10 + DEBOUNCE_TICKS), EpochSecs(200));
         assert_eq!(s.get(2).unwrap().status, Status::Running, "un-quieted and promoted");
+    }
+
+    #[test]
+    fn set_remote_extras_composes_defaults_and_extras() {
+        // "distrobox" is not in DEFAULT_REMOTE: an ordinary command until it's
+        // added as an extra, then it earns the Remote presentation — using
+        // whatever display `classify` gave it (no host-extraction bonus).
+        let mut s = CommandStore::default();
+        s.on_command_changed(1, &argv(&["distrobox", "enter", "dev"]), true, None, 0);
+        s.on_timer(Tick(DEBOUNCE_TICKS), EpochSecs(100));
+        assert_eq!(s.get(1).unwrap().kind, Kind::Command);
+
+        let changed = s.set_remote_extras(["distrobox"]);
+        assert!(changed);
+        assert_eq!(s.get(1).unwrap().kind, Kind::Remote, "already-promoted row re-kinds live");
+        assert!(!s.needs_ticks(), "a steady remote row costs zero ticks");
+
+        let changed = s.set_remote_extras([]);
+        assert!(changed);
+        assert_eq!(s.get(1).unwrap().kind, Kind::Command, "removing the extra reverts the kind");
+    }
+
+    #[test]
+    fn set_remote_extras_is_a_no_op_for_default_remote_names() {
+        // A DEFAULT_REMOTE name already got its Kind from `classify`'s
+        // dedicated branch (Remote or Command, by trailing-command shape) —
+        // the extras sweep must never clobber that back to Remote.
+        let mut s = CommandStore::default();
+        s.on_command_changed(1, &argv(&["ssh", "box", "cargo", "build"]), true, None, 0);
+        s.on_timer(Tick(DEBOUNCE_TICKS), EpochSecs(100));
+        assert_eq!(s.get(1).unwrap().kind, Kind::Command, "trailing remote command stays a Job");
+        s.set_remote_extras(["ssh"]);
+        assert_eq!(
+            s.get(1).unwrap().kind,
+            Kind::Command,
+            "ssh is a DEFAULT_REMOTE name — the sweep must not touch it"
+        );
+    }
+
+    #[test]
+    fn mosh_bootstrap_lands_on_the_client_label() {
+        // Real mosh: a perl script whose bootstrap ssh carries a trailing
+        // `-- mosh-server new …` (a Job, so the Remote pending is replaced),
+        // then `mosh-client <ip> <port>`. There is no hostname to carry over —
+        // the final label is honestly the client's IP, and it is Remote.
+        let mut s = CommandStore::default();
+        s.on_command_changed(1, &argv(&["mosh", "prod-db"]), true, None, 0);
+        s.on_command_changed(
+            1,
+            &argv(&["ssh", "-n", "-tt", "prod-db", "--", "mosh-server", "new", "-c", "256"]),
+            true, None, 1,
+        );
+        s.on_command_changed(1, &argv(&["mosh-client", "1.2.3.4", "60001"]), true, None, 1);
+        s.on_timer(Tick(1 + DEBOUNCE_TICKS), EpochSecs(100));
+        let obs = s.get(1).unwrap();
+        assert_eq!((obs.msg.as_str(), obs.kind), ("mosh-client 1.2.3.4", Kind::Remote));
+    }
+
+    #[test]
+    fn a_new_remote_session_never_inherits_the_previous_label() {
+        // `ssh boxA` returns to the shell; `ssh boxB` starts inside the
+        // tentative-Done window. boxB must wear its own name — label
+        // inheritance across sessions would misattribute boxB's eventual
+        // disconnect to boxA.
+        let mut s = CommandStore::default();
+        s.on_command_changed(1, &argv(&["ssh", "boxA"]), true, None, 0);
+        s.on_timer(Tick(DEBOUNCE_TICKS), EpochSecs(100));
+        s.on_command_changed(1, &argv(&["zsh"]), true, None, 3);
+        s.on_command_changed(1, &argv(&["ssh", "boxB"]), true, None, 4);
+        s.on_timer(Tick(4 + DEBOUNCE_TICKS), EpochSecs(100));
+        assert_eq!(s.get(1).unwrap().msg, "ssh boxB");
+    }
+
+    #[test]
+    fn set_remote_extras_leaves_non_remote_kinds_alone() {
+        // The sweep runs on every load and every config override, so it must
+        // be a strict Remote↔non-Remote flip for names moving in or out of
+        // the set — never a re-stamp of classify's Server/Test/Build kinds
+        // (which would turn a steady dev-server row into a spinning Job).
+        let mut s = CommandStore::default();
+        s.on_command_changed(1, &argv(&["npm", "run", "dev"]), true, None, 0);
+        s.on_command_changed(2, &argv(&["cargo", "test"]), true, None, 0);
+        s.on_command_changed(3, &argv(&["cargo", "build"]), true, None, 0);
+        s.on_command_changed(4, &argv(&["pytest"]), true, None, 0); // stays pending
+        s.on_timer(Tick(DEBOUNCE_TICKS), EpochSecs(100));
+        s.on_command_changed(4, &argv(&["pytest"]), true, None, DEBOUNCE_TICKS);
+        assert!(!s.set_remote_extras([]), "empty extras: nothing observable changes");
+        assert!(!s.set_remote_extras(["distrobox"]), "an extra no row uses: still nothing");
+        assert_eq!(s.get(1).unwrap().kind, Kind::Server);
+        assert_eq!(s.get(2).unwrap().kind, Kind::Test);
+        assert_eq!(s.get(3).unwrap().kind, Kind::Build);
+        assert!(!s.get(1).unwrap().animating(), "the dev server stays steady");
+        s.on_timer(Tick(2 * DEBOUNCE_TICKS), EpochSecs(100));
+        assert_eq!(s.get(4).unwrap().kind, Kind::Test, "a pending's kind survives the sweep");
+    }
+
+    #[test]
+    fn display_remote_keeps_scanning_options_after_the_destination() {
+        // OpenSSH re-enters option parsing after the host, and mosh's
+        // Getopt::Long accepts options anywhere — so post-destination options
+        // are still a session, and only the first non-option token after the
+        // destination starts a remote command.
+        assert_eq!(classify(&argv(&["ssh", "prod-db", "-p", "2222"])), ("ssh prod-db".into(), Kind::Remote));
+        assert_eq!(
+            classify(&argv(&["ssh", "prod-db", "-N", "-L", "8080:localhost:80"])),
+            ("ssh prod-db".into(), Kind::Remote)
+        );
+        assert_eq!(
+            classify(&argv(&["mosh", "prod-db", "--predict", "adaptive"])),
+            ("mosh prod-db".into(), Kind::Remote)
+        );
+        assert_eq!(classify(&argv(&["ssh", "prod-db", "-t", "htop"])), ("ssh prod-db".into(), Kind::Command));
+        // `--` ends options: what follows is the destination, then the command.
+        assert_eq!(classify(&argv(&["ssh", "--", "prod-db"])), ("ssh prod-db".into(), Kind::Remote));
+        assert_eq!(classify(&argv(&["ssh", "prod-db", "--", "cargo", "build"])), ("ssh prod-db".into(), Kind::Command));
+        // getopt cluster semantics: the first value-taking letter either
+        // owns the rest of the token or, when last, the next token.
+        assert_eq!(display(&argv(&["ssh", "-4p", "2222", "prod-db"])), "ssh prod-db");
+        assert_eq!(display(&argv(&["ssh", "-4C", "prod-db"])), "ssh prod-db");
+        assert_eq!(display(&argv(&["ssh", "-lbob", "prod-db"])), "ssh prod-db", "attached value ending in a value letter");
+        assert_eq!(display(&argv(&["ssh", "-Clbob", "prod-db"])), "ssh prod-db");
+        assert_eq!(display(&argv(&["ssh", "-oBatchMode=yes", "prod-db"])), "ssh prod-db");
+    }
+
+    #[test]
+    fn remote_destination_keeps_ipv6_literals_whole() {
+        // The `:port` strip belongs to the URI grammar only; a bare IPv6
+        // literal has no port to strip and must survive intact.
+        assert_eq!(classify(&argv(&["ssh", "::1"])), ("ssh ::1".into(), Kind::Remote));
+        assert_eq!(display(&argv(&["ssh", "2001:db8::1"])), "ssh 2001:db8::1");
+        assert_eq!(display(&argv(&["ssh", "user@[::1]"])), "ssh ::1");
+        assert_eq!(display(&argv(&["ssh", "ssh://user@[::1]:2222/"])), "ssh ::1");
+        assert_eq!(display(&argv(&["ssh", "ssh://prod-db:2222"])), "ssh prod-db");
+        assert_eq!(
+            classify(&argv(&["mosh-client", "::1", "60001"])),
+            ("mosh-client ::1".into(), Kind::Remote)
+        );
+        // et's non-URI `host:port` still strips (one colon), and a bracketed
+        // IPv6 literal with a port unwraps outside the URI form too.
+        assert_eq!(display(&argv(&["et", "user@prod-db:2022"])), "et prod-db");
+        assert_eq!(display(&argv(&["et", "[::1]:2022"])), "et ::1");
+    }
+
+    #[test]
+    fn display_remote_uses_per_tool_option_tables() {
+        // autossh's `-M <port>` is its defining option and takes a value; for
+        // plain ssh `-M` is a bare flag — so the short-option table is per exe.
+        assert_eq!(classify(&argv(&["autossh", "-M", "0", "prod-db"])), ("autossh prod-db".into(), Kind::Remote));
+        assert_eq!(classify(&argv(&["ssh", "-M", "prod-db"])), ("ssh prod-db".into(), Kind::Remote));
+        // et's and mosh's separated-value long options are skipped with their
+        // value, so the real host is still the destination.
+        assert_eq!(classify(&argv(&["et", "--jumphost", "bastion", "prod-db"])), ("et prod-db".into(), Kind::Remote));
+        assert_eq!(display(&argv(&["et", "--jport", "2022", "prod-db:2022"])), "et prod-db");
+        assert_eq!(classify(&argv(&["mosh", "--family", "inet", "prod-db"])), ("mosh prod-db".into(), Kind::Remote));
+        // `--` alone, and `--` before both destination and command.
+        assert_eq!(classify(&argv(&["ssh", "--"])), ("ssh".into(), Kind::Command));
+        assert_eq!(classify(&argv(&["ssh", "--", "prod-db", "-p"])), ("ssh prod-db".into(), Kind::Command));
+    }
+
+    #[test]
+    fn remote_running_does_not_arm_the_timer() {
+        // Mirrors `service_running_does_not_arm_the_timer`: a connected remote
+        // session is steady — nothing animates, so it must not pin the 1 Hz
+        // cadence (the whole point of `AGENTS.md`'s "never poll" rule).
+        let mut s = CommandStore::default();
+        s.on_command_changed(1, &argv(&["ssh", "prod-db"]), true, None, 0);
+        assert!(s.needs_ticks(), "pending promotion still needs a tick");
+        s.on_timer(Tick(DEBOUNCE_TICKS), EpochSecs(100));
+        let obs = s.get(1).unwrap();
+        assert_eq!((obs.status, obs.kind), (Status::Running, Kind::Remote));
+        assert!(!s.needs_ticks(), "a steady remote session costs zero ticks");
+        assert!(!obs.animating(), "a Running remote is not animating");
     }
 
     #[test]
