@@ -878,6 +878,25 @@ fn own_presence_counts_live_status_panes_not_tab_rollups_or_unseated_payloads() 
 }
 
 #[test]
+fn own_presence_publishes_the_tab_tree_only_with_session_tree_on() {
+    let setup = |session_tree: bool| {
+        let mut rt = runtime_with_granted_permission();
+        rt.config.session_tree = session_tree;
+        rt.tabs_changed(vec![tab(0, "pair", true)]);
+        rt.radar.set_tab_panes_for_position(0, vec![pane(10)]);
+        rt.status_pipe(&payload_json(10, "running"));
+        rt.own_presence()
+    };
+    let off = setup(false);
+    assert_eq!(off.running, 1, "counts publish either way");
+    assert!(off.tabs.is_empty(), "off: no tree, so no extra presence writes per agent label");
+
+    let on = setup(true);
+    assert_eq!(on.tabs.len(), 1);
+    assert_eq!(on.tabs[0].panes.len(), 1, "the agent pane rides the tree");
+}
+
+#[test]
 fn own_presence_excludes_command_attention_and_uses_the_first_status_tab() {
     let mut rt = runtime_with_granted_permission();
     rt.tabs_changed(vec![tab(0, "command", false), tab(3, "agent", true)]);
@@ -1003,6 +1022,44 @@ fn session_cycle_arms_fast_cadence_for_the_idle_commit() {
         "a pending cycle selection must arm Fast so the idle-commit fires promptly, got {:?}",
         out.effects
     );
+}
+
+#[test]
+fn empty_local_session_shows_the_peer_tree_only_with_session_tree_on() {
+    let peer =
+        r#"{"session_name":"peer","running":0,"attention":0,"tabs":[{"position":0,"name":"review","panes":[]}] }"#;
+
+    // Off (default): no local tabs and no ledger is still onboarding — the
+    // compact badge alone never justified a rail.
+    let mut rt = runtime_with_granted_permission();
+    rt.presences_changed(vec![fresh(peer)]);
+    assert!(!rt.render(20, 80).contains("review"), "off: no peer tree");
+
+    // On: the peer tree alone is navigation worth a rail.
+    let mut rt = runtime_with_granted_permission();
+    rt.config.session_tree = true;
+    rt.presences_changed(vec![fresh(peer)]);
+    let ansi = rt.render(20, 80);
+    assert!(ansi.contains("peer"), "badge={:?} ansi={ansi:?}", rt.sessions.badge());
+    assert!(ansi.contains("review"));
+}
+
+#[test]
+fn session_tree_moves_peer_lines_below_the_local_cards() {
+    // Same bookkeeping as `clicking_a_session_line_emits_switch_session`, tree
+    // on: line 0 = title, 1 = rule, 2 = own "work" heading, 3 = local tab,
+    // 4 = peer "alpha" heading (clickable).
+    let mut rt = runtime_with_granted_permission();
+    rt.config.session_tree = true;
+    rt.tabs_changed(vec![tab(0, "team", false)]);
+    rt.presences_changed(vec![fresh(
+        r#"{"session_name":"alpha","running":0,"attention":1,"attention_tab_position":2}"#,
+    )]);
+    rt.render(100, 80);
+
+    assert_eq!(rt.mouse_click(2, 0), Outcome::default(), "own heading is click-inert");
+    let peer_click = rt.mouse_click(4, 0);
+    assert_eq!(peer_click.effects, vec![Effect::SwitchSession { name: "alpha".into(), tab_position: Some(2) }]);
 }
 
 #[test]

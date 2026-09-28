@@ -127,6 +127,15 @@ and needs-you agent-pane counts. With a single session the badge is invisible.
 
 - **Click a line** to switch to that session, landing on its attention tab if
   it has one.
+- **`session_tree true`** ([configuration](configuration.md)) expands the
+  badge into a tree. Your session's line heads your own tabs; each other
+  session follows them with its tab names and agent rows (tabs without agents
+  still appear). Click a peer tab or agent row to switch to that tab; it does
+  not focus a particular pane there. Peer rows only use the height left after
+  your local tabs, the ledger, and the footer, so a short rail shows fewer of
+  them (or none); session lines always remain visible. A session publishes
+  its tree only when it has the option on, so set it in every session's
+  config.
 - **`session-next` / `session-prev`** move a highlight through the same order.
   The switch happens about a second after your last tap; landing back on your
   own session cancels.
