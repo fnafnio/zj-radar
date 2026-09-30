@@ -89,6 +89,11 @@ const IGNORE_NAMES: &[&str] = &[
 /// Matched on the peeled program — including a node/bun-hosted agent script.
 pub const AGENT_NAMES: &[&str] = &["claude", "codex", "opencode", "pi"];
 
+/// The CLI's own binary. A hook's `zj-radar notify ...` child can briefly ride
+/// a pane's foreground while pushing a status; it must never surface as a fake
+/// `Kind::Command` row. It is neither a shell nor the pane's agent identity.
+pub const SELF_NAME: &str = "zj-radar";
+
 /// Interactive programs — editors, pagers, monitors, git TUIs, file managers —
 /// that sit open waiting on the *user* rather than doing bounded work
 /// (`docs/activity-model.md`: the Companion class). Classification data, not an
@@ -187,17 +192,25 @@ impl Default for CommandStore {
     }
 }
 
-/// Extract the basename from a path-like string (split on `/`, take last
-/// non-empty segment; empty string if input is empty).
+/// Extract the basename from a path-like string (split on `/` or `\`, take
+/// last non-empty segment; empty string if input is empty).
 fn basename(s: &str) -> &str {
-    s.rsplit('/').find(|seg| !seg.is_empty()).unwrap_or("")
+    s.rsplit(['/', '\\']).find(|seg| !seg.is_empty()).unwrap_or("")
 }
 
-/// Basename with any login-shell `-` prefix stripped: a login shell's argv0 is
-/// reported as e.g. `-zsh`, which must still hit the shell/agent ignore sets.
-/// Used ONLY for those membership checks — display strings keep the raw name.
+/// Strip a trailing Windows `.exe` suffix from a program name. Zellij reports
+/// this suffix on Windows, while all command vocabularies use bare names.
+fn strip_exe_suffix(s: &str) -> &str {
+    if s.len() > 4 && s[s.len() - 4..].eq_ignore_ascii_case(".exe") {
+        &s[..s.len() - 4]
+    } else {
+        s
+    }
+}
+
+/// Basename with login-shell `-` and Windows `.exe` suffixes stripped.
 fn program_name(s: &str) -> &str {
-    basename(s).trim_start_matches('-')
+    strip_exe_suffix(basename(s).trim_start_matches('-'))
 }
 
 fn is_option_arg(s: &str) -> bool {
@@ -266,7 +279,7 @@ fn effective_command(command: &[String]) -> &[String] {
             i += 1;
         }
         match command.get(i) {
-            Some(tok) if WRAPPERS.contains(&basename(tok)) => i += 1,
+            Some(tok) if WRAPPERS.contains(&program_name(tok)) => i += 1,
             _ => break,
         }
     }
@@ -567,7 +580,7 @@ fn classify(command: &[String]) -> (String, Kind) {
     let Some(first) = command.first() else {
         return (String::new(), Kind::Command);
     };
-    let exe = basename(first);
+    let exe = strip_exe_suffix(basename(first));
     let args = &command[1..];
 
     // Agents classify by identity, not by rule: an exe that IS an agent's
@@ -714,10 +727,9 @@ impl CommandStore {
         // Peel env-prefixes/wrappers once at intake so the ignore check, the
         // display string, and the Kind all classify the real command.
         let (command, name) = effective_program(command);
-        // Shells and agents are both "not a real command we track here": shells
-        // mean back-to-the-prompt; agents are owned by the push pipe (see
-        // AGENT_NAMES). Either way we never open a command lifecycle for them.
-        let in_ignore_set = IGNORE_NAMES.contains(&name) || AGENT_NAMES.contains(&name);
+        // Shells, push-owned agents, and the CLI's transient notify child do
+        // not own a command lifecycle on the rail.
+        let in_ignore_set = IGNORE_NAMES.contains(&name) || AGENT_NAMES.contains(&name) || name == SELF_NAME;
         let interactive = self.interactive.contains(name);
 
         // An interactive argv takes the intake arm below whatever the
@@ -1110,7 +1122,8 @@ impl CommandStore {
     /// `display_first_token_is_the_exe_basename`). Returns whether anything
     /// observable changed (the caller's render/persist trigger).
     pub fn set_interactive_extras<'a>(&mut self, extras: impl IntoIterator<Item = &'a str>) -> bool {
-        self.interactive = DEFAULT_INTERACTIVE.iter().copied().chain(extras).map(str::to_string).collect();
+        self.interactive =
+            DEFAULT_INTERACTIVE.iter().copied().chain(extras).map(|name| strip_exe_suffix(name).to_string()).collect();
         let mut changed = false;
         // Re-judge every pending against the new set — symmetric, so removing
         // an extra un-quiets its pending and the next tick promotes it. The

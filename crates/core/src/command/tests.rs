@@ -40,6 +40,8 @@ fn is_shell_prompt_covers_non_posix_shells_and_login_argv0() {
     // there is no binary named e.g. `-nu` in practice, but a real command
     // with a dashed basename stays a command.
     assert!(!is_shell_prompt(&argv(&["my-tool"])));
+    assert!(is_shell_prompt(&argv(&["pwsh.exe"])));
+    assert!(is_shell_prompt(&argv(&["-bash.EXE"])));
 }
 
 #[test]
@@ -594,6 +596,30 @@ fn absolute_argv0_path_basename_used_for_command_and_repo() {
     assert_eq!(s.repo, "myproject", "repo must be basename of cwd");
 }
 
+#[test]
+fn windows_argv0_paths_and_exe_suffixes_classify_like_bare_programs() {
+    let mut store = CommandStore::default();
+    let cmd = argv(&["C:\\Users\\me\\scoop\\shims\\cargo.EXE", "build"]);
+    store.on_command_changed(1, &cmd, true, Some("C:\\work\\project"), 1);
+    store.on_timer(Tick(1 + DEBOUNCE_TICKS), EpochSecs(0));
+    let status = store.get(1).expect("must be Running");
+    assert_eq!(status.msg, "cargo build");
+    assert_eq!(status.kind, Kind::Build);
+    assert_eq!(status.repo, "project");
+
+    assert!(is_agent_command(&argv(&["opencode.exe"])));
+    assert_eq!(classify(&argv(&["python.exe", "-m", "pytest"])), ("python -m pytest".into(), Kind::Test));
+}
+
+#[test]
+fn windows_exe_interactive_extra_matches_bare_program() {
+    let mut store = CommandStore::default();
+    store.set_interactive_extras(["k9s.exe"]);
+    store.on_command_changed(1, &argv(&["k9s.exe"]), true, None, 0);
+    assert_eq!(store.quiet_identity(1), Some(("k9s", Kind::Command)));
+    assert!(!store.needs_ticks());
+}
+
 // ── Test 7: prune drops dead panes from all maps
 
 #[test]
@@ -1069,6 +1095,8 @@ fn interactive_set_disjoint_from_prompt_and_agent_names() {
         assert!(!IGNORE_NAMES.contains(name), "{name} must not double as a shell-prompt name");
         assert!(!AGENT_NAMES.contains(name), "{name} must not double as a push-agent name");
     }
+    assert!(!IGNORE_NAMES.contains(&SELF_NAME), "SELF_NAME must not be a shell-prompt name");
+    assert!(!AGENT_NAMES.contains(&SELF_NAME), "SELF_NAME must not be a push-agent name");
     // WRAPPERS is a different animal (a transparency list, not a
     // classification role) but must stay disjoint from ALL FOUR
     // membership lists: `effective_program` peels a wrapper away before
@@ -1092,6 +1120,17 @@ fn interactive_set_disjoint_from_prompt_and_agent_names() {
                 && !DEFAULT_REMOTE.contains(name),
             "{name} is a JS runtime host, not a membership-list name"
         );
+    }
+}
+
+#[test]
+fn zj_radar_notify_child_is_not_tracked() {
+    for exe in ["zj-radar", "zj-radar.exe"] {
+        let mut store = CommandStore::default();
+        store.on_command_changed(1, &argv(&[exe, "notify", "opencode"]), true, Some("/work/repo"), 1);
+        store.on_timer(Tick(1 + DEBOUNCE_TICKS), EpochSecs(0));
+        assert!(store.get(1).is_none(), "{exe} must leave no command state");
+        assert!(!store.pending.contains_key(&1), "{exe} must not enter pending");
     }
 }
 
