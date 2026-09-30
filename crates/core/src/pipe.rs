@@ -101,13 +101,60 @@ const SELF_LIMITING_SEND: &str = concat!(
     "wait \"$p\" 2>/dev/null; s=$?; kill \"$w\" 2>/dev/null; exit \"$s\"",
 );
 
+/// Directories Git for Windows installs its bundled MSYS `sh.exe` under,
+/// relative to the Git install root. Neither is on `PATH` by default.
+const WINDOWS_GIT_SH_SUFFIXES: &[&str] = &["bin\\sh.exe", "usr\\bin\\sh.exe"];
+
+/// Env vars that may hold a Git-for-Windows install root. The per-user root is
+/// handled separately because it includes an extra `Programs\\Git` segment.
+const WINDOWS_GIT_ROOT_VARS: &[&str] = &["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"];
+
+fn windows_git_sh_candidates(
+    machine_roots: &[&std::ffi::OsStr],
+    local_app_data: Option<&std::ffi::OsStr>,
+) -> Vec<std::path::PathBuf> {
+    let mut candidates = Vec::new();
+    for root in machine_roots {
+        for suffix in WINDOWS_GIT_SH_SUFFIXES {
+            candidates.push(std::path::Path::new(root).join("Git").join(suffix));
+        }
+    }
+    if let Some(local) = local_app_data {
+        for suffix in WINDOWS_GIT_SH_SUFFIXES {
+            candidates.push(std::path::Path::new(local).join("Programs").join("Git").join(suffix));
+        }
+    }
+    candidates
+}
+
+/// Resolve the POSIX shell used by the bounded sender. Git for Windows installs
+/// one without normally putting it on PATH, so search its standard roots after
+/// honoring an existing PATH entry.
+fn resolve_sh() -> String {
+    if let Some(paths) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&paths) {
+            if dir.join("sh").is_file() || dir.join("sh.exe").is_file() {
+                return "sh".to_string();
+            }
+        }
+    }
+    let roots: Vec<std::ffi::OsString> = WINDOWS_GIT_ROOT_VARS.iter().filter_map(std::env::var_os).collect();
+    let roots: Vec<&std::ffi::OsStr> = roots.iter().map(std::ffi::OsString::as_os_str).collect();
+    for candidate in windows_git_sh_candidates(&roots, std::env::var_os("LocalAppData").as_deref()) {
+        if candidate.is_file() {
+            return candidate.to_string_lossy().into_owned();
+        }
+    }
+    "sh".to_string()
+}
+
 /// Argv for one self-limiting status broadcast: spawn it and the subtree
 /// guarantees its own exit within `timeout_secs` (plus scheduling slack),
-/// even if the spawner dies first. POSIX `sh` only — the same portability
-/// bar as every other host command this workspace spawns.
+/// even if the spawner dies first. `resolve_sh` finds Git for Windows' POSIX
+/// shell when its bare name is not available on PATH.
 pub fn self_limiting_pipe_argv(payload: &str, timeout_secs: u64) -> Vec<String> {
     vec![
-        "sh".to_string(),
+        resolve_sh(),
         "-c".to_string(),
         SELF_LIMITING_SEND.to_string(),
         "zj-radar-pipe".to_string(),  // $0 — a label for ps output
@@ -124,7 +171,7 @@ mod tests {
     #[test]
     fn argv_carries_payload_and_deadline_as_positionals() {
         let argv = self_limiting_pipe_argv(r#"{"v":1,"msg":"a b; $(rm)"}"#, 5);
-        assert_eq!(argv[0], "sh");
+        assert!(argv[0] == "sh" || argv[0].ends_with("sh.exe"));
         assert_eq!(argv[1], "-c");
         // The payload rides verbatim as a positional parameter — never
         // interpolated into the script text, so no quoting/escaping exists
@@ -133,6 +180,21 @@ mod tests {
         assert_eq!(argv[5], STATUS_PIPE_NAME);
         assert_eq!(argv[6], r#"{"v":1,"msg":"a b; $(rm)"}"#);
         assert!(!argv[2].contains("rm"), "script must not embed the payload");
+    }
+
+    #[test]
+    fn windows_git_sh_candidates_cover_machine_and_user_installs() {
+        let machine = std::ffi::OsStr::new(r"C:\Program Files");
+        let user = std::ffi::OsStr::new(r"C:\Users\me\AppData\Local");
+        assert_eq!(
+            windows_git_sh_candidates(&[machine], Some(user)),
+            vec![
+                std::path::Path::new(machine).join("Git").join("bin\\sh.exe"),
+                std::path::Path::new(machine).join("Git").join("usr\\bin\\sh.exe"),
+                std::path::Path::new(user).join("Programs").join("Git").join("bin\\sh.exe"),
+                std::path::Path::new(user).join("Programs").join("Git").join("usr\\bin\\sh.exe"),
+            ]
+        );
     }
 
     #[test]
@@ -153,6 +215,7 @@ mod tests {
     /// would block on the watchdog's sleep too) — that would stall every
     /// producer hook ~5s per tool call with the whole suite still green,
     /// since the hung-path tests only assert reaping, not latency.
+    #[cfg(unix)]
     #[test]
     fn healthy_send_exits_immediately_not_at_the_watchdog_deadline() {
         use std::os::unix::fs::PermissionsExt;
@@ -187,6 +250,7 @@ mod tests {
 
     /// Spawn the argv with a shim dir prepended to PATH and return the
     /// wrapper's exit status. Shared by the exit-status tests below.
+    #[cfg(unix)]
     fn run_wrapper(shim_dir: &std::path::Path, timeout_secs: u64) -> std::process::ExitStatus {
         let argv = self_limiting_pipe_argv("{}", timeout_secs);
         let mut path = shim_dir.as_os_str().to_owned();
@@ -202,6 +266,7 @@ mod tests {
             .unwrap()
     }
 
+    #[cfg(unix)]
     fn install_shim(dir: &std::path::Path, body: &str) {
         use std::os::unix::fs::PermissionsExt;
         let shim = dir.join("zellij");
@@ -212,6 +277,7 @@ mod tests {
     /// The wrapper's exit status IS `zellij pipe`'s: the CLI producer records
     /// a send as delivered (for its last-sent dedup) only on success, so a
     /// client that failed — no server, bad session — must not read as sent.
+    #[cfg(unix)]
     #[test]
     fn wrapper_propagates_the_clients_exit_status() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -224,6 +290,7 @@ mod tests {
     /// delivered (the message is queued server-side, but the producer cannot
     /// know that), so the wrapper must exit non-zero — never a silent `exit 0`
     /// that would let the producer record the payload as sent.
+    #[cfg(unix)]
     #[test]
     fn wrapper_exits_nonzero_when_the_watchdog_kills_the_client() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -241,6 +308,7 @@ mod tests {
     /// The property the argv exists for, exercised for real: spawn it against
     /// a hanging `zellij` shim, SIGKILL the spawner immediately, and the hung
     /// child is still reaped by the in-subtree watchdog.
+    #[cfg(unix)]
     #[test]
     fn subtree_reaps_a_hung_send_even_when_the_spawner_dies() {
         use std::io::Read;
