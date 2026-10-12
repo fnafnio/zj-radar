@@ -265,13 +265,14 @@ mod tests {
         let path = std::path::Path::new("/Users/m/My Config/zj-radar.js");
         let bak = super::super::path_with_suffix(path, super::super::BACKUP_SUFFIX);
         let line = kept_backup_line("pi", &bak, path, false);
-        assert!(line.starts_with("pi: left /Users/m/My Config/zj-radar.js.zj-radar.bak (not ours"), "{line}");
-        assert!(
-            line.ends_with(
-                "`mv '/Users/m/My Config/zj-radar.js.zj-radar.bak' '/Users/m/My Config/zj-radar.js'` to restore it"
-            ),
-            "{line}"
-        );
+        // Both paths are spelled by `display()`, like the code under test, so
+        // this pins the LINE SHAPE (quoting of a path with spaces, the `mv`
+        // argument order) rather than the host's separator.
+        assert!(line.starts_with(&format!("pi: left {} (not ours", bak.display())), "{line}");
+        assert!(line.ends_with(&format!("`mv '{}' '{}'` to restore it", bak.display(), path.display())), "{line}");
+        // The quoting is the point: an unquoted path with a space would split
+        // into two `mv` arguments when pasted.
+        assert!(line.contains("'/Users/m/My Config/zj-radar.js'"), "{line}");
         assert!(kept_backup_line("pi", &bak, path, true).starts_with("pi: would leave "));
     }
 

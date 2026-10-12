@@ -63,7 +63,9 @@ pub(crate) fn read_zellij_env(config_dir: &Path, layout_name: Option<&str>) -> (
         producers: ProducerTexts::read(),
         wasm_present: wasm_dest.is_file(),
         config_managed: path_is_managed(&config_path),
-        wasm_path: wasm_dest.to_string_lossy().into_owned(),
+        // Spelled the way Zellij keys `permissions.kdl` (forward slashes on
+        // every host), not the way this OS spells a path.
+        wasm_path: crate::run::permission_key(&wasm_dest),
         zellij_version: zellij_version_output(),
         config_text,
     };

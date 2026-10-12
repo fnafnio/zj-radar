@@ -127,10 +127,25 @@ pub(crate) fn grant_float_args(session: &str, wasm_path: &Path) -> Vec<String> {
 pub(crate) const REQUIRED_PLUGIN_PERMISSIONS: [&str; 4] =
     ["ReadApplicationState", "ReadCliPipes", "ChangeApplicationState", "RunCommands"];
 
+/// Spell `wasm_abs_path` the way Zellij keys it in `permissions.kdl`.
+///
+/// Zellij stores the plugin's `file:` URL path, which uses `/` on every host
+/// — including Windows, where it writes `"C:/Users/…/plugins/zj_radar.wasm"`.
+/// A key built from a `PathBuf`'s own `display()` would carry `\` there, so it
+/// would never match Zellij's entry: the pre-seed would append a second, dead
+/// block, and the doctor would then report "granted" by matching zj-radar's
+/// own dead entry rather than anything Zellij honors.
+///
+/// On unix the path contains no `\`, so this is the identity.
+pub(crate) fn permission_key(wasm_abs_path: &Path) -> String {
+    wasm_abs_path.to_string_lossy().replace('\\', "/")
+}
+
 /// True iff `permissions.kdl`'s EFFECTIVE grant for `wasm_abs_path` covers the
 /// full permission set the plugin requests. Zellij keys grants by the literal
 /// path string, so an exact match (closing quote included) is correct; the `{`
-/// guard skips a bare quoted string that isn't a block header.
+/// guard skips a bare quoted string that isn't a block header. The path must
+/// be spelled by [`permission_key`].
 ///
 /// Duplicate blocks follow Zellij's own semantics: the file loads into a map
 /// keyed by path, so the LAST block for a path is the one Zellij consults —
@@ -189,16 +204,51 @@ pub(crate) fn owned_config_dir_in(data_dir: &Path) -> PathBuf {
     data_dir.join("zj-radar").join("zellij")
 }
 
-/// Zellij's cache root under `cache_dir` — `permissions.kdl` and every
-/// plugin's `/cache` mount live below it. The folder differs between macOS
-/// (`org.Zellij-Contributors.Zellij`) and Linux (`zellij`).
-pub(crate) fn zellij_cache_root_in(cache_dir: &Path, is_macos: bool) -> PathBuf {
-    cache_dir.join(if is_macos { "org.Zellij-Contributors.Zellij" } else { "zellij" })
+/// Which spelling of Zellij's cache root this host uses. Zellij builds it
+/// from the `directories` crate's project dirs, whose layout differs per OS:
+///
+/// - macOS:   `<cache>/org.Zellij-Contributors.Zellij`
+/// - Linux:   `<cache>/zellij`               (`<cache>` = `$XDG_CACHE_HOME`)
+/// - Windows: `<cache>/Zellij/cache`         (`<cache>` = `%LOCALAPPDATA%`)
+///
+/// Windows carries the extra `cache` leaf because `%LOCALAPPDATA%` is the
+/// project ROOT there, not a cache root — getting this wrong points every
+/// grant probe at a file Zellij never writes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum CacheLayout {
+    Macos,
+    Linux,
+    Windows,
 }
 
-/// Zellij's `permissions.kdl` rooted under `cache_dir`.
-pub(crate) fn permissions_path_in(cache_dir: &Path, is_macos: bool) -> PathBuf {
-    zellij_cache_root_in(cache_dir, is_macos).join("permissions.kdl")
+impl CacheLayout {
+    /// The layout of the host this binary was built for.
+    pub(crate) const fn host() -> Self {
+        if cfg!(target_os = "macos") {
+            Self::Macos
+        } else if cfg!(windows) {
+            Self::Windows
+        } else {
+            Self::Linux
+        }
+    }
+}
+
+/// Zellij's cache root under `cache_dir` — `permissions.kdl` and every
+/// plugin's `/cache` mount live below it.
+pub(crate) fn zellij_cache_root_in(cache_dir: &Path, layout: CacheLayout) -> PathBuf {
+    match layout {
+        CacheLayout::Macos => cache_dir.join("org.Zellij-Contributors.Zellij"),
+        CacheLayout::Linux => cache_dir.join("zellij"),
+        CacheLayout::Windows => cache_dir.join("Zellij").join("cache"),
+    }
+}
+
+/// Zellij's `permissions.kdl` rooted under `cache_dir`. The layout primitive
+/// behind [`zellij_permissions_path`], which applies the override first.
+#[cfg(test)]
+pub(crate) fn permissions_path_in(cache_dir: &Path, layout: CacheLayout) -> PathBuf {
+    zellij_cache_root_in(cache_dir, layout).join("permissions.kdl")
 }
 
 /// Platform-resolved owned config dir, or `None` if the data dir is unknown.
@@ -212,10 +262,26 @@ pub(crate) fn owned_config_dir() -> Option<PathBuf> {
     dirs::data_dir().map(|d| owned_config_dir_in(&d))
 }
 
+/// Zellij's cache root — `permissions.kdl` and every plugin's `/cache` mount
+/// live below it. `ZJ_RADAR_CACHE_DIR` overrides the platform-resolved one;
+/// it is the same variable `zj-radar state` reads, and names the Zellij cache
+/// root itself (already past the per-OS [`CacheLayout`] arithmetic).
+///
+/// The override is what makes the grant flows testable off Linux: on Windows
+/// `dirs::cache_dir()` calls `SHGetKnownFolderPath`, which consults no
+/// environment variable, so without it a test could only read and write the
+/// developer's live Zellij state.
+pub(crate) fn zellij_cache_root() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("ZJ_RADAR_CACHE_DIR").filter(|d| !d.is_empty()) {
+        return Some(PathBuf::from(dir));
+    }
+    dirs::cache_dir().map(|c| zellij_cache_root_in(&c, CacheLayout::host()))
+}
+
 /// Platform-resolved path to Zellij's `permissions.kdl`, or `None` if the cache
 /// dir is unknown.
 pub(crate) fn zellij_permissions_path() -> Option<PathBuf> {
-    dirs::cache_dir().map(|c| permissions_path_in(&c, cfg!(target_os = "macos")))
+    zellij_cache_root().map(|r| r.join("permissions.kdl"))
 }
 
 /// `permissions.kdl` contents when the cache dir resolves and the file reads —
@@ -397,7 +463,7 @@ struct RunPlan {
 /// surface whether we're nested.
 fn plan_run(facts: &RunFacts) -> RunPlan {
     let granted =
-        facts.permissions_kdl.as_deref().is_some_and(|kdl| wasm_is_granted(kdl, &facts.wasm_path.to_string_lossy()));
+        facts.permissions_kdl.as_deref().is_some_and(|kdl| wasm_is_granted(kdl, &permission_key(&facts.wasm_path)));
 
     let args = if facts.session_exists {
         attach_session_args(&facts.config_dir, &facts.session)
@@ -785,21 +851,24 @@ mod tests {
         // The explicit `--config` is load-bearing on BOTH: Zellij's precedence
         // is `--config` flag > ZELLIJ_CONFIG_FILE env > `<config-dir>/config.kdl`,
         // so without it a user-exported ZELLIJ_CONFIG_FILE silently swaps the
-        // owned config out (blank rail, dead keybinds) — including in
+        // owned config out (blank rail, dead keybinds) - including in
         // `--print-cmd` output, which can't carry env changes.
+        // The config path is spelled with `join`, like the code under test, so
+        // the assertion is about the ARG SHAPE rather than the host's separator.
+        let cfg_dir = Path::new("/cfg");
+        let cfg_file = cfg_dir.join("config.kdl").display().to_string();
         assert_eq!(
-            create_session_args(Path::new("/cfg"), "foo", "radar"),
+            create_session_args(cfg_dir, "foo", "radar"),
             vec![
-                "--config", "/cfg/config.kdl", "--config-dir", "/cfg", "--session", "foo", "--new-session-with-layout",
-                "radar"
+                "--config", &cfg_file, "--config-dir", "/cfg", "--session", "foo", "--new-session-with-layout", "radar"
             ]
         );
         // The owned config on attach is load-bearing: a resurrected session is
         // a NEW server whose config (Ctrl-y grant keybind included) comes from
         // the attaching client, not from the session's creation.
         assert_eq!(
-            attach_session_args(Path::new("/cfg"), "foo"),
-            vec!["--config", "/cfg/config.kdl", "--config-dir", "/cfg", "attach", "foo"]
+            attach_session_args(cfg_dir, "foo"),
+            vec!["--config", &cfg_file, "--config-dir", "/cfg", "attach", "foo"]
         );
     }
 
@@ -865,6 +934,27 @@ mod tests {
         assert_eq!(shell_join(&s(&["it's", ""])), r"'it'\''s' ''");
         // Shell metacharacters (globs, vars, semicolons) get quoted, not trusted.
         assert_eq!(shell_join(&s(&["a b", "$HOME", "*;rm"])), "'a b' '$HOME' '*;rm'");
+    }
+
+    #[test]
+    fn permission_key_spells_the_path_the_way_zellij_keys_it() {
+        // Zellij writes the plugin's URL path, so the key uses `/` even on
+        // Windows. Observed in a real `%LOCALAPPDATA%\Zellij\cache\
+        // permissions.kdl`, which keys this plugin as
+        // "C:/LocalFiles/.config/zellij/plugins/zj_radar.wasm".
+        assert_eq!(
+            permission_key(Path::new(r"C:\LocalFiles\.config\zellij\plugins\zj_radar.wasm")),
+            "C:/LocalFiles/.config/zellij/plugins/zj_radar.wasm"
+        );
+        // A unix path is already in that spelling and must pass through
+        // untouched — `\` is a legal filename byte there, never a separator.
+        let unix = "/Users/m/.config/zellij/plugins/zj_radar.wasm";
+        assert_eq!(permission_key(Path::new(unix)), unix);
+        // The key the doctor looks for and the key the preseed writes are the
+        // same function, so a grant zj-radar writes is one it can later find.
+        let key = permission_key(Path::new(r"C:\p\zj_radar.wasm"));
+        let perms = REQUIRED_PLUGIN_PERMISSIONS.join("\n    ");
+        assert!(wasm_is_granted(&format!("\"{key}\" {{\n    {perms}\n}}\n"), &key));
     }
 
     #[test]
@@ -939,12 +1029,30 @@ mod tests {
 
     #[test]
     fn locators_compose_expected_paths() {
+        let cache = Path::new("/cache");
         assert_eq!(owned_config_dir_in(Path::new("/data")), Path::new("/data/zj-radar/zellij"));
         assert_eq!(
-            permissions_path_in(Path::new("/cache"), true),
-            Path::new("/cache/org.Zellij-Contributors.Zellij/permissions.kdl")
+            permissions_path_in(cache, CacheLayout::Macos),
+            cache.join("org.Zellij-Contributors.Zellij").join("permissions.kdl")
         );
-        assert_eq!(permissions_path_in(Path::new("/cache"), false), Path::new("/cache/zellij/permissions.kdl"));
+        assert_eq!(permissions_path_in(cache, CacheLayout::Linux), cache.join("zellij").join("permissions.kdl"));
+        // Windows keeps a `cache` leaf under the project root, because the
+        // `<cache>` it starts from is `%LOCALAPPDATA%` — the project ROOT, not
+        // a cache dir. Without it every grant probe reads a file Zellij never
+        // writes, and the installer pre-seeds a grant Zellij never reads.
+        assert_eq!(
+            permissions_path_in(cache, CacheLayout::Windows),
+            cache.join("Zellij").join("cache").join("permissions.kdl")
+        );
+        // The three layouts must stay distinct — a collision would silently
+        // make one host read another's file.
+        let roots = [CacheLayout::Macos, CacheLayout::Linux, CacheLayout::Windows]
+            .map(|l| zellij_cache_root_in(cache, l))
+            .to_vec();
+        let mut unique = roots.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), roots.len(), "cache roots must be distinct per layout: {roots:?}");
     }
 
     fn test_assets() -> Assets {
@@ -985,7 +1093,10 @@ mod tests {
         assert_eq!(m.wasm_path, dir.join("plugins/zj_radar.wasm"));
         assert_eq!(std::fs::read(&m.wasm_path).unwrap(), b"\0asm-dummy");
         let cfg = std::fs::read_to_string(dir.join("config.kdl")).unwrap();
-        assert!(cfg.contains(&format!("file:{}", m.wasm_path.display())));
+        // Compare the DECODED location, not the raw bytes: the path rides a
+        // KDL string, so a Windows `\` is written escaped (`\\`) and the raw
+        // `display()` spelling is deliberately absent from the file.
+        assert_eq!(plugin_location(&cfg), format!("file:{}", m.wasm_path.display()));
         assert!(!cfg.contains("@WASM@"));
         assert!(dir.join("layouts/radar.kdl").exists());
         assert_eq!(
@@ -994,18 +1105,29 @@ mod tests {
         );
     }
 
-    #[test]
-    fn materialize_escapes_the_wasm_path_inside_the_kdl_string() {
-        // A `"` in the data dir must not terminate `location="file:…"` early:
-        // the written config must parse, and decode back to the real path.
-        let d = tempdir().unwrap();
-        let dir = d.path().join("we\"ird").join("zellij");
-        let m = materialize(&dir, "0.1.0", &test_assets()).unwrap();
-        let cfg = std::fs::read_to_string(dir.join("config.kdl")).unwrap();
+    /// The `radar` alias's `location`, decoded by a real KDL parse. Shared by
+    /// the substitution tests so both assert on the value Zellij would read
+    /// rather than on the escaped bytes, which differ per host separator.
+    fn plugin_location(cfg: &str) -> String {
         let doc: kdl::KdlDocument = cfg.parse().unwrap_or_else(|e| panic!("config must parse ({e}):\n{cfg}"));
         let radar = doc.get("plugins").and_then(|p| p.children()).and_then(|c| c.get("radar")).expect("radar alias");
-        let location = radar.get("location").and_then(|v| v.as_string()).expect("location string");
-        assert_eq!(location, format!("file:{}", m.wasm_path.display()));
+        radar.get("location").and_then(|v| v.as_string()).expect("location string").to_string()
+    }
+
+    #[test]
+    fn materialize_escapes_the_wasm_path_inside_the_kdl_string() {
+        // A `"` in the data dir must not terminate `location="file:."` early:
+        // the written config must parse, and decode back to the real path.
+        // Unix-only: Windows forbids `"` in a filename outright, so the
+        // hazard this guards cannot arise there.
+        #[cfg(unix)]
+        {
+            let d = tempdir().unwrap();
+            let dir = d.path().join("we\"ird").join("zellij");
+            let m = materialize(&dir, "0.1.0", &test_assets()).unwrap();
+            let cfg = std::fs::read_to_string(dir.join("config.kdl")).unwrap();
+            assert_eq!(plugin_location(&cfg), format!("file:{}", m.wasm_path.display()));
+        }
     }
 
     #[test]

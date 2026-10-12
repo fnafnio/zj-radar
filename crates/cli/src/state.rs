@@ -39,6 +39,21 @@ pub(crate) struct SessionView {
     pub v: u32,
 }
 
+/// Does `name` name a Zellij plugin-URL scheme dir?
+///
+/// Zellij spells a plugin URL as a path under its scheme, so the dir is
+/// `file:` on unix. Windows forbids `:` in a filename, so Zellij sanitizes it
+/// to `_` and the same dir is `file_` (its drive segment likewise becomes
+/// `C_`). Accepting only `:` makes `zj-radar state` find nothing at all on a
+/// Windows Zellij host.
+///
+/// Both spellings are accepted on every host rather than behind a `cfg`: the
+/// roots scanned can be a mount or a copy from another machine, and a false
+/// positive costs only a `plugin_cache` walk that finds no presence files.
+fn is_scheme_dir(name: &str) -> bool {
+    name.ends_with(':') || name.ends_with('_')
+}
+
 /// Every `zj-radar.presence.*.json` under each root's `plugin_cache` dirs.
 /// A Zellij cache root holds one dir per plugin URL, spelled as a path under
 /// its scheme (`file:/Users/…/zj_radar.wasm/plugin_cache/`), plus per-server
@@ -55,7 +70,7 @@ pub(crate) fn read_presence_files(roots: &[PathBuf], now: SystemTime) -> Vec<Raw
     for root in roots {
         let Ok(entries) = std::fs::read_dir(root) else { continue };
         for entry in entries.flatten() {
-            let is_scheme = entry.file_name().to_string_lossy().ends_with(':');
+            let is_scheme = is_scheme_dir(&entry.file_name().to_string_lossy());
             if is_scheme && entry.file_type().is_ok_and(|t| t.is_dir()) {
                 find_plugin_caches(&entry.path(), 0, &mut dirs);
             }
@@ -148,16 +163,7 @@ pub(crate) fn collect(files: Vec<RawFile>, current: Option<&str>) -> Vec<Session
 /// Where to look: `ZJ_RADAR_CACHE_DIR` (a Zellij cache root) if set, else the
 /// platform's. Never a `/tmp` root (see [`read_presence_files`]).
 pub(crate) fn default_roots() -> Vec<PathBuf> {
-    let zellij_cache =
-        dirs::cache_dir().map(|cache| crate::run::zellij_cache_root_in(&cache, cfg!(target_os = "macos")));
-    roots_from(
-        std::env::var_os("ZJ_RADAR_CACHE_DIR").filter(|d| !d.is_empty()).map(PathBuf::from),
-        zellij_cache.as_deref(),
-    )
-}
-
-fn roots_from(override_dir: Option<PathBuf>, zellij_cache: Option<&Path>) -> Vec<PathBuf> {
-    override_dir.or_else(|| zellij_cache.map(Path::to_path_buf)).into_iter().collect()
+    crate::run::zellij_cache_root().into_iter().collect()
 }
 
 pub(crate) struct StateOptions {
@@ -263,7 +269,7 @@ pub(crate) fn run(opts: StateOptions) -> std::process::ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{Duration, SystemTime};
+    use std::time::SystemTime;
 
     fn presence(name: &str, updated: u64, panes: &[(&str, &str, &str)]) -> String {
         // panes: (origin, kind, status)
@@ -276,6 +282,21 @@ mod tests {
     }
     fn raw(json: String, age_s: u64) -> RawFile {
         RawFile { json, age_s }
+    }
+
+    /// A Zellij plugin-cache dir under a `file:` scheme root, at
+    /// `<root>/file:<under>/plugin_cache`.
+    ///
+    /// Unix-only, and so is every test that needs one: the scheme dir's name
+    /// ends in `:`, which Windows reads as an alternate-data-stream separator
+    /// and refuses to create. Nothing is lost by skipping those tests there —
+    /// the layout they model is a Zellij cache root, and the walk that reads
+    /// it ([`read_presence_files`]) is itself OS-agnostic.
+    #[cfg(unix)]
+    fn scheme_cache(root: &Path, under: &str) -> PathBuf {
+        let cache = root.join(format!("file:{under}")).join("plugin_cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        cache
     }
 
     #[test]
@@ -309,11 +330,11 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn walks_only_scheme_dirs_to_plugin_caches() {
         let root = tempfile::tempdir().unwrap();
-        let cache = root.path().join("file:/Users/x/plugins/zj_radar.wasm/plugin_cache");
-        std::fs::create_dir_all(&cache).unwrap();
+        let cache = scheme_cache(root.path(), "/Users/x/plugins/zj_radar.wasm");
         std::fs::write(cache.join("zj-radar.presence.42.json"), presence("w", 1, &[])).unwrap();
         std::fs::write(cache.join("zj-radar.42.json"), "{}").unwrap(); // snapshot, not presence
         std::fs::write(cache.join("zj-radar.presence.42.json.tmp"), "x").unwrap();
@@ -324,6 +345,43 @@ mod tests {
         let files = read_presence_files(&[root.path().to_path_buf()], SystemTime::now());
         assert_eq!(files.len(), 1, "only the file: subtree, only presence json");
         assert!(files[0].json.contains("\"w\""));
+    }
+
+    /// The Windows spelling of the same tree: Zellij sanitizes the `:` it
+    /// cannot put in a filename to `_`, so the scheme dir is `file_` and the
+    /// drive segment `C_`. Runs on every host — the fixture needs no illegal
+    /// characters, which is exactly why this layout is the one Windows gets.
+    #[test]
+    fn windows_sanitized_scheme_dirs_are_walked_too() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = root
+            .path()
+            .join("file_")
+            .join("C_")
+            .join("Users")
+            .join("x")
+            .join("plugins")
+            .join("zj_radar.wasm")
+            .join("plugin_cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(cache.join("zj-radar.presence.42.json"), presence("win", 1, &[])).unwrap();
+        // A sibling that is neither spelling must still be skipped.
+        let noise = root.path().join("0b1c-uuid").join("plugin_cache");
+        std::fs::create_dir_all(&noise).unwrap();
+        std::fs::write(noise.join("zj-radar.presence.9.json"), presence("noise", 1, &[])).unwrap();
+
+        let files = read_presence_files(&[root.path().to_path_buf()], SystemTime::now());
+        assert_eq!(files.len(), 1, "the file_ subtree is a scheme dir like file: is");
+        assert!(files[0].json.contains("\"win\""));
+    }
+
+    #[test]
+    fn scheme_dir_accepts_both_spellings_and_nothing_else() {
+        assert!(is_scheme_dir("file:"), "the unix spelling");
+        assert!(is_scheme_dir("file_"), "the Windows-sanitized spelling");
+        assert!(!is_scheme_dir("0b1c-uuid"), "a per-server UUID dir is not a scheme");
+        assert!(!is_scheme_dir("zellij_status-bar"), "a built-in plugin's dir is not a scheme");
+        assert!(!is_scheme_dir(""), "an empty name is not a scheme");
     }
 
     #[test]
@@ -337,15 +395,13 @@ mod tests {
         std::fs::create_dir_all(&flat).unwrap();
         std::fs::write(flat.join("zj-radar.presence.1.json"), presence("planted", 1, &[])).unwrap();
         assert!(read_presence_files(&[flat], SystemTime::now()).is_empty());
-        assert_eq!(roots_from(None, Some(Path::new("/c"))), vec![PathBuf::from("/c")]);
     }
 
     #[cfg(unix)]
     #[test]
     fn only_regular_files_are_read_and_reads_are_bounded() {
         let dir = tempfile::tempdir().unwrap();
-        let cache = dir.path().join("file:/p/plugin_cache");
-        std::fs::create_dir_all(&cache).unwrap();
+        let cache = scheme_cache(dir.path(), "/p");
         let elsewhere = dir.path().join("real.json");
         std::fs::write(&elsewhere, presence("linked", 1, &[])).unwrap();
         std::os::unix::fs::symlink(&elsewhere, cache.join("zj-radar.presence.1.json")).unwrap();
@@ -362,13 +418,13 @@ mod tests {
         assert!(collect(files, None).is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn future_mtime_clamps_to_zero() {
         let dir = tempfile::tempdir().unwrap();
-        let cache = dir.path().join("file:/p/plugin_cache");
-        std::fs::create_dir_all(&cache).unwrap();
+        let cache = scheme_cache(dir.path(), "/p");
         std::fs::write(cache.join("zj-radar.presence.1.json"), presence("w", 1, &[])).unwrap();
-        let past = SystemTime::now() - Duration::from_secs(3600);
+        let past = SystemTime::now() - std::time::Duration::from_secs(3600);
         assert_eq!(read_presence_files(&[dir.path().to_path_buf()], past)[0].age_s, 0);
     }
 

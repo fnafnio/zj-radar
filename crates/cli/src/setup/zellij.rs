@@ -497,7 +497,7 @@ fn run_preseed(wasm_dest: &Path, granted: Option<bool>, yes: bool, dry_run: bool
         return false; // no resolvable cache dir — the hint still covers first launch
     };
     let existing = std::fs::read_to_string(&perms_path).ok();
-    let merged = match merge_grant(existing.as_deref(), &wasm_dest.display().to_string()) {
+    let merged = match merge_grant(existing.as_deref(), &crate::run::permission_key(wasm_dest)) {
         Ok(Preseed::AlreadyGranted) => return true,
         Ok(Preseed::Merged(text)) => text,
         Err(e) => {

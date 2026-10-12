@@ -169,21 +169,23 @@ fn branch_from_head(git_dir: &Path) -> Option<String> {
 ///   /Users/m/dev/pinky/.git        → "pinky"      (normal checkout or any worktree of it)
 ///   /Users/m/dev/pinky/.git/       → "pinky"
 ///   /Users/m/dev/acme.git          → "acme"       (bare repo)
+///   C:/Users/m/dev/pinky/.git      → "pinky"      (git's spelling on Windows)
+///   \\?\C:\Users\m\dev\pinky\.git  → "pinky"      (canonicalize's, on Windows)
 ///   .git                           → None         (relative — caller falls back)
 fn repo_name_from_common_dir(common_dir: &str) -> Option<String> {
-    let trimmed = common_dir.trim().trim_end_matches('/');
+    let trimmed = common_dir.trim().trim_end_matches(SEPS);
     // git < 2.31 doesn't know `--path-format`; rev-parse ECHOES the unknown
     // flag to stdout (exit 0), so the captured "dir" is the flag text plus a
     // relative `.git` on a second line. Require a single-line absolute path —
     // anything else falls back to `--show-toplevel` in the caller.
-    if trimmed.is_empty() || !trimmed.starts_with('/') || trimmed.contains('\n') {
+    if trimmed.is_empty() || !is_rooted(trimmed) || trimmed.contains('\n') {
         return None;
     }
-    let base = trimmed.rsplit('/').next().unwrap_or(trimmed);
+    let base = trimmed.rsplit(SEPS).next().unwrap_or(trimmed);
     if base == ".git" {
         // Repo root is the parent of the ".git" dir.
-        let parent = trimmed[..trimmed.len() - base.len()].trim_end_matches('/');
-        parent.rsplit('/').find(|s| !s.is_empty()).map(str::to_string)
+        let parent = trimmed[..trimmed.len() - base.len()].trim_end_matches(SEPS);
+        parent.rsplit(SEPS).find(|s| !s.is_empty()).map(str::to_string)
     } else if let Some(stripped) = base.strip_suffix(".git") {
         // Bare repo "name.git".
         (!stripped.is_empty()).then(|| stripped.to_string())
@@ -191,6 +193,28 @@ fn repo_name_from_common_dir(common_dir: &str) -> Option<String> {
         // Unusual: a common dir not ending in .git — use its basename.
         Some(base.to_string())
     }
+}
+
+/// Both path separators, always. These strings arrive from two places that
+/// disagree on Windows — git's own output uses `/` with a drive letter
+/// (`C:/…`), `std::fs::canonicalize` returns a verbatim `\\?\C:\…` — and the
+/// test fixtures spell paths POSIX-style on every host. Splitting on both
+/// costs nothing on unix, where `\` is a legal (if unusual) filename byte
+/// only inside a segment this code never has to preserve.
+const SEPS: [char; 2] = ['/', '\\'];
+
+/// Absolute enough to trust as a real git dir rather than git's echo of an
+/// unknown flag: a POSIX `/…` root, or a Windows drive-letter (`C:\…`,
+/// `C:/…`) or UNC/verbatim (`\\?\C:\…`, `\\server\share\…`) root.
+///
+/// Deliberately not `Path::is_absolute`: on Windows that rejects a rooted but
+/// driveless `/Users/…`, which this module's own fixtures use on every host.
+/// The check only has to be strict enough to reject `--path-format=absolute`
+/// and `relative/.git`, which it is.
+fn is_rooted(s: &str) -> bool {
+    let b = s.as_bytes();
+    matches!(b.first(), Some(b'/' | b'\\'))
+        || matches!(b, [drive, b':', b'/' | b'\\', ..] if drive.is_ascii_alphabetic())
 }
 
 /// Run `git -C <cwd> <args…>` and return its trimmed stdout, or `None` when git
@@ -216,7 +240,7 @@ fn spawn_repo_branch(cwd: &str) -> (String, String) {
     let repo = git_output(cwd, &["rev-parse", "--path-format=absolute", "--git-common-dir"])
         .and_then(|d| repo_name_from_common_dir(&d))
         .or_else(|| {
-            git_output(cwd, &["rev-parse", "--show-toplevel"]).map(|p| p.rsplit('/').next().unwrap_or(&p).to_string())
+            git_output(cwd, &["rev-parse", "--show-toplevel"]).map(|p| p.rsplit(SEPS).next().unwrap_or(&p).to_string())
         })
         .unwrap_or_default();
     let branch = git_output(cwd, &["branch", "--show-current"]).unwrap_or_default();
@@ -247,6 +271,23 @@ mod tests {
         assert_eq!(repo_name_from_common_dir(".git"), None);
         assert_eq!(repo_name_from_common_dir(""), None);
         assert_eq!(repo_name_from_common_dir("   "), None);
+    }
+
+    #[test]
+    fn common_dir_reads_windows_spellings_of_an_absolute_path() {
+        // git on Windows prints a drive letter with forward slashes; the
+        // native walk's `canonicalize` hands back a verbatim `\\?\` path.
+        // Both must name the repo, or the Windows native path is dead and
+        // every hook silently pays for the git spawns instead.
+        assert_eq!(repo_name_from_common_dir("C:/Users/m/dev/pinky/.git"), Some("pinky".into()));
+        assert_eq!(repo_name_from_common_dir(r"C:\Users\m\dev\pinky\.git"), Some("pinky".into()));
+        assert_eq!(repo_name_from_common_dir(r"\\?\C:\Users\m\dev\pinky\.git"), Some("pinky".into()));
+        assert_eq!(repo_name_from_common_dir(r"\\?\C:\Users\m\dev\pinky\.git\"), Some("pinky".into()));
+        assert_eq!(repo_name_from_common_dir(r"\\server\share\acme.git"), Some("acme".into()));
+        // A bare drive root carries no name, and the flag-echo guard still
+        // holds for a backslash-spelled relative path.
+        assert_eq!(repo_name_from_common_dir(r"C:\"), None);
+        assert_eq!(repo_name_from_common_dir(r"relative\.git"), None);
     }
 
     #[test]
