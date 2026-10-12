@@ -343,6 +343,10 @@ mod tests {
 
     /// `send` against a hanging `zellij` shim returns at the backstop, not
     /// with the child, and reports the send as not delivered.
+    ///
+    /// Unix-only: the shim is an executable `#!/bin/sh` script reached through
+    /// a `:`-separated PATH.
+    #[cfg(unix)]
     #[test]
     fn send_returns_undelivered_at_the_backstop_when_the_wrapper_hangs() {
         let dir = tempfile::TempDir::new().unwrap();

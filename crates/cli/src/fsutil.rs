@@ -75,6 +75,8 @@ mod tests {
         assert_eq!(std::fs::read(&target).unwrap(), b"second");
     }
 
+    // Unix-only: the setup needs a real symlink at the temp sibling name.
+    #[cfg(unix)]
     #[test]
     fn a_symlink_at_the_temp_name_is_replaced_not_followed() {
         let d = tempdir().unwrap();

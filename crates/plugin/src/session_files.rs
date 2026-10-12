@@ -1166,7 +1166,14 @@ mod tests {
         // have reaped it either).
         let old_path = dir.path().join("zj-radar.presence.300.json");
         let old_age = Duration::from_secs(400); // well past sessions::STALE_AFTER_SECS (90s)
-        std::fs::File::open(&old_path).unwrap().set_modified(SystemTime::now() - old_age).unwrap();
+                                                // Opened for write (as at the `backdate` helper below): Windows needs
+                                                // write access to set a file's mtime, where Unix accepts a read-only fd.
+        std::fs::File::options()
+            .write(true)
+            .open(&old_path)
+            .unwrap()
+            .set_modified(SystemTime::now() - old_age)
+            .unwrap();
 
         let mut peers = reader.files.read_peer_presences();
         peers.sort_by(|a, b| a.json.cmp(&b.json));

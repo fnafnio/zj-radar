@@ -167,16 +167,26 @@ pub fn unix_now() -> u64 {
 /// never collide, and [`private_dir`] vets it. Its own leaf, not `zj-radar/`:
 /// on Linux that is the plugin's `/tmp/zj-radar` session-file root, whose
 /// presence scans read the directory.
+#[cfg(unix)]
 pub(crate) fn state_dir() -> Option<PathBuf> {
     let uid = current_uid()?;
     let dir = dirs::runtime_dir().unwrap_or_else(std::env::temp_dir).join(format!("zj-radar-dedup-{uid}"));
     private_dir(&dir, uid).then_some(dir)
 }
 
+// The Unix implementation relies on ownership and mode checks to reject a
+// pre-created shared-temp directory. Disable the optional cache until Windows
+// has an equivalent ACL-based validation path.
+#[cfg(not(unix))]
+pub(crate) fn state_dir() -> Option<PathBuf> {
+    None
+}
+
 /// This process's (effective) uid without a libc dependency: `/proc/self` is
 /// owned by it on Linux; without procfs (macOS) the home dir's owner is the
 /// std-only proxy. A wrong answer can only fail into "dedup off" —
 /// [`private_dir`] then rejects the dir as foreign.
+#[cfg(unix)]
 fn current_uid() -> Option<u32> {
     use std::os::unix::fs::MetadataExt;
     std::fs::metadata("/proc/self").ok().or_else(|| std::fs::metadata(dirs::home_dir()?).ok()).map(|m| m.uid())
@@ -186,6 +196,7 @@ fn current_uid() -> Option<u32> {
 /// directory (`lstat`: a symlink is rejected, never followed), owned by
 /// `uid`, with no group/other permission bits. Anything else — including a
 /// dir another user pre-created in a shared `/tmp` — means dedup is off.
+#[cfg(unix)]
 fn private_dir(dir: &Path, uid: u32) -> bool {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt};
     let _ = std::fs::DirBuilder::new().mode(0o700).create(dir);
@@ -261,6 +272,7 @@ mod tests {
         assert!(!is_redundant(&key, &last(key.clone(), u64::MAX), 0));
     }
 
+    #[cfg(unix)]
     #[test]
     fn private_dir_is_created_0700_and_reused() {
         use std::os::unix::fs::MetadataExt;
@@ -272,6 +284,7 @@ mod tests {
         assert!(private_dir(&dir, uid), "an existing private dir is reused");
     }
 
+    #[cfg(unix)]
     #[test]
     fn private_dir_rejects_open_foreign_or_symlinked_dirs() {
         use std::os::unix::fs::PermissionsExt;
