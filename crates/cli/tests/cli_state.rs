@@ -1,11 +1,25 @@
 //! `zj-radar state` end to end against a fake Zellij cache root
 //! (`ZJ_RADAR_CACHE_DIR`), laid out like the real one: plugin URL spelled as
-//! nested dirs under `file:`, plus per-server UUID noise.
+//! nested dirs under the scheme dir, plus per-server UUID noise.
 use assert_cmd::Command;
 use std::time::{Duration, SystemTime};
 
+/// The scheme dir's name on this host. Zellij spells it `file:`, except on
+/// Windows, where `:` is illegal in a filename and it writes `file_` (the
+/// drive segment likewise becomes `C_`). Each host is therefore exercised
+/// against the tree Zellij actually creates there.
+const SCHEME_DIR: &str = if cfg!(windows) { "file_" } else { "file:" };
+
+/// `<root>/<SCHEME_DIR>/<url_path>/plugin_cache`, built per component so the
+/// separator is the host's rather than the `/` in `url_path`.
+fn plugin_cache(root: &std::path::Path, url_path: &str) -> std::path::PathBuf {
+    let mut dir = root.join(SCHEME_DIR);
+    dir.extend(url_path.split('/').filter(|s| !s.is_empty()));
+    dir.join("plugin_cache")
+}
+
 fn write_presence(root: &std::path::Path, url_path: &str, pid: u32, json: &str, age: Duration) {
-    let dir = root.join("file:").join(url_path.trim_start_matches('/')).join("plugin_cache");
+    let dir = plugin_cache(root, url_path);
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(format!("zj-radar.presence.{pid}.json"));
     std::fs::write(&path, json).unwrap();
@@ -108,7 +122,7 @@ fn a_fifo_named_like_a_presence_file_is_skipped_promptly() {
     // /dev/zero would grow without bound): only regular files are read.
     let root = tempfile::tempdir().unwrap();
     write_presence(root.path(), "/p/zj_radar.wasm", 10, WAITING, Duration::ZERO);
-    let fifo = root.path().join("file:/p/zj_radar.wasm/plugin_cache/zj-radar.presence.66.json");
+    let fifo = plugin_cache(root.path(), "/p/zj_radar.wasm").join("zj-radar.presence.66.json");
     let made = std::process::Command::new("mkfifo").arg(&fifo).status().unwrap();
     assert!(made.success());
     let out = state(root.path()).arg("--json").timeout(Duration::from_secs(10)).assert().success();

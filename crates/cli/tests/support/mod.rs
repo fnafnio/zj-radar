@@ -24,6 +24,19 @@ impl ShimDir {
         ShimDir { dir: TempDir::new().unwrap() }
     }
 
+    /// Write `script` as an executable `<dir>/<name>`. The one place the
+    /// shim bytes and the `0o755` land, so no installer can drift into
+    /// writing a file PATH lookup would skip.
+    #[cfg(unix)]
+    fn install(&self, name: &str, script: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = self.dir.path().join(name);
+        fs::write(&bin, script).unwrap();
+        let mut perms = fs::metadata(&bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&bin, perms).unwrap();
+    }
+
     /// Install a fake `name` binary that records argv + stdin to
     /// `<dir>/<name>.log` (one tab-separated line per invocation) and exits 0.
     ///
@@ -31,12 +44,17 @@ impl ShimDir {
     /// `/usr/bin/env` (nor bash), and a shim that fails to exec makes
     /// `notify`'s spawn a silent no-op — the suite then fails with zero
     /// recorded broadcasts instead of pointing at the real problem.
+    ///
+    /// Unix-only, as is every shim installer below: Windows has no shebang
+    /// mechanism, so a script dropped on PATH is not an executable there.
+    #[cfg(unix)]
     pub fn add_recorder(&self, name: &str) {
         self.add_recorder_exiting(name, 0);
     }
 
     /// `add_recorder`, but the shim exits with `code` after recording —
     /// models a `zellij pipe` that ran and failed (no server, bad session).
+    #[cfg(unix)]
     pub fn add_recorder_exiting(&self, name: &str, code: i32) {
         let log = self.dir.path().join(format!("{name}.log"));
         let script = format!(
@@ -44,12 +62,7 @@ impl ShimDir {
              printf '%s\\t%s\\n' \"$*\" \"$(printf '%s' \"$stdin\" | tr '\\n' ' ')\" >> {log:?}\nexit {code}\n",
             log = log
         );
-        let bin = self.dir.path().join(name);
-        fs::write(&bin, script).unwrap();
-        let mut perms = fs::metadata(&bin).unwrap().permissions();
-        use std::os::unix::fs::PermissionsExt;
-        perms.set_mode(0o755);
-        fs::set_permissions(&bin, perms).unwrap();
+        self.install(name, &script);
     }
 
     /// Install a fake `name` binary that records argv like `add_recorder` and
@@ -59,6 +72,7 @@ impl ShimDir {
     /// the code under test must reap the hung process itself, not an
     /// intermediate shell. The pid lands after the log line, so a test that
     /// waits on the pid may also rely on the argv having been recorded.
+    #[cfg(unix)]
     pub fn add_hanging_recorder(&self, name: &str, secs: u32) {
         let log = self.dir.path().join(format!("{name}.log"));
         let pid_file = self.dir.path().join(format!("{name}.pid"));
@@ -67,12 +81,7 @@ impl ShimDir {
             log = log,
             pid_file = pid_file
         );
-        let bin = self.dir.path().join(name);
-        fs::write(&bin, script).unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(&bin).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&bin, perms).unwrap();
+        self.install(name, &script);
     }
 
     /// Poll for the pid reported by `add_hanging_recorder`. Panics past
@@ -103,6 +112,7 @@ impl ShimDir {
     ///   `git -C <cwd> branch --show-current`      → branch name
     ///
     /// `$3` is the subcommand after `-C <cwd>`.
+    #[cfg(unix)]
     pub fn add_fake_git(&self, repo_toplevel: &str, branch: &str) {
         let script = format!(
             "#!/bin/sh\n\
@@ -114,12 +124,7 @@ impl ShimDir {
             repo = repo_toplevel,
             branch = branch
         );
-        let bin = self.dir.path().join("git");
-        fs::write(&bin, script).unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(&bin).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&bin, perms).unwrap();
+        self.install("git", &script);
     }
 
     /// The single recorded `zellij pipe` broadcast, joined back into one
@@ -136,13 +141,12 @@ impl ShimDir {
         c.args.join(" ")
     }
 
-    /// PATH value with this shim dir prepended.
+    /// PATH value with this shim dir prepended, joined with the host's own
+    /// separator (`:`, or `;` on Windows) rather than a hardcoded one.
     pub fn path_env(&self) -> OsString {
         let existing = std::env::var_os("PATH").unwrap_or_default();
-        let mut p = self.dir.path().as_os_str().to_owned();
-        p.push(":");
-        p.push(existing);
-        p
+        let dirs = std::iter::once(self.dir.path().to_path_buf()).chain(std::env::split_paths(&existing));
+        std::env::join_paths(dirs).expect("shim dir must be joinable into a PATH")
     }
 
     /// Parse the log written by `add_recorder`. Each line is `args\tstdin`.

@@ -10,8 +10,30 @@ mod support;
 
 use assert_cmd::Command;
 use std::fs;
-use support::{ShimDir, HOOK_MARKER};
+// `ShimDir` installs POSIX shims, so only the unix-gated tests below use it.
+#[cfg(unix)]
+use support::ShimDir;
+use support::HOOK_MARKER;
 use tempfile::TempDir;
+
+/// Assert that `stdout` carries a `` `mv <bak> <target>` to restore it `` hint.
+///
+/// Matches the ARGUMENT ORDER rather than an exact string: whether each path
+/// is shell-quoted is `shell_quote`'s call (a Windows `\` forces quotes, a
+/// bare `/tmp/...` does not), and that is pinned by its own unit test. The
+/// target is searched for only after the `.bak` argument, since the bridge
+/// path is a literal prefix of its own backup's name.
+fn assert_restore_hint(stdout: &str, bak: &std::path::Path, target: &std::path::Path) {
+    let rest = stdout.split_once("`mv ").unwrap_or_else(|| panic!("no restore command in:\n{stdout}")).1;
+    let restore = rest.split_once("` to restore it").unwrap_or_else(|| panic!("no restore suffix in:\n{stdout}")).0;
+    let bak_s = bak.display().to_string();
+    let bak_at = restore.find(&bak_s).unwrap_or_else(|| panic!("the .bak is not an argument of: mv {restore}"));
+    let after_bak = &restore[bak_at + bak_s.len()..];
+    assert!(
+        after_bak.contains(&target.display().to_string()),
+        "restore must move the .bak BACK onto the bridge path: mv {restore}"
+    );
+}
 
 /// Returns a fresh tempdir with an empty hooks.json pre-created so that
 /// `codex_installed()` returns true (it accepts an existing hooks.json).
@@ -30,12 +52,7 @@ fn setup_codex_installs_hooks_without_touching_foreign_notify() {
     let config = codex_home.path().join("config.toml");
     fs::write(&config, "notify = [\"/other/notifier\", \"turn-ended\"]\n").unwrap();
 
-    Command::cargo_bin("zj-radar")
-        .unwrap()
-        .args(["setup", "codex", "--yes"])
-        .env("CODEX_HOME", codex_home.path())
-        .assert()
-        .success();
+    zj_radar().args(["setup", "codex", "--yes"]).env("CODEX_HOME", codex_home.path()).assert().success();
 
     let config_after = fs::read_to_string(config).unwrap();
     assert_eq!(config_after, "notify = [\"/other/notifier\", \"turn-ended\"]\n");
@@ -53,23 +70,13 @@ fn setup_dry_run_does_not_write_hooks_json() {
     let hooks_path = codex_home.path().join("hooks.json");
 
     // dry-run must leave hooks.json unchanged (still the empty `{}` seed)
-    Command::cargo_bin("zj-radar")
-        .unwrap()
-        .args(["setup", "codex", "--dry-run", "--yes"])
-        .env("CODEX_HOME", codex_home.path())
-        .assert()
-        .success();
+    zj_radar().args(["setup", "codex", "--dry-run", "--yes"]).env("CODEX_HOME", codex_home.path()).assert().success();
 
     let after_dry_run = fs::read_to_string(&hooks_path).unwrap();
     assert_eq!(after_dry_run.trim(), "{}", "dry-run must not modify hooks.json; got: {after_dry_run:?}");
 
     // Positive control: the same CODEX_HOME without --dry-run MUST install our hooks.
-    Command::cargo_bin("zj-radar")
-        .unwrap()
-        .args(["setup", "codex", "--yes"])
-        .env("CODEX_HOME", codex_home.path())
-        .assert()
-        .success();
+    zj_radar().args(["setup", "codex", "--yes"]).env("CODEX_HOME", codex_home.path()).assert().success();
 
     let after_real = fs::read_to_string(&hooks_path).unwrap();
     assert!(after_real.contains(HOOK_MARKER), "real run must have written our hook command; got: {after_real:?}");
@@ -86,12 +93,7 @@ fn setup_codex_hooks_is_idempotent() {
     let hooks_path = codex_home.path().join("hooks.json");
 
     let run = || {
-        Command::cargo_bin("zj-radar")
-            .unwrap()
-            .args(["setup", "codex", "--yes"])
-            .env("CODEX_HOME", codex_home.path())
-            .assert()
-            .success();
+        zj_radar().args(["setup", "codex", "--yes"]).env("CODEX_HOME", codex_home.path()).assert().success();
     };
 
     // First run installs
@@ -120,8 +122,7 @@ fn setup_codex_guidance_warns_when_hooks_feature_disabled() {
     let codex_home = isolated_codex_home();
     fs::write(codex_home.path().join("config.toml"), "[features]\nhooks = false\n").unwrap();
 
-    let output = Command::cargo_bin("zj-radar")
-        .unwrap()
+    let output = zj_radar()
         .args(["setup", "codex", "--yes"])
         .env("CODEX_HOME", codex_home.path())
         .assert()
@@ -148,8 +149,7 @@ fn setup_codex_guidance_silent_on_disabled_warning_when_hooks_enabled() {
     // `/hooks` reminder still must.
     let codex_home = isolated_codex_home();
 
-    let output = Command::cargo_bin("zj-radar")
-        .unwrap()
+    let output = zj_radar()
         .args(["setup", "codex", "--yes"])
         .env("CODEX_HOME", codex_home.path())
         .assert()
@@ -177,8 +177,7 @@ fn setup_zellij_refuses_wasm_and_download_together() {
     let config_dir = TempDir::new().unwrap();
     let config_path = config_dir.path().join("config.kdl");
 
-    let assert = Command::cargo_bin("zj-radar")
-        .unwrap()
+    let assert = zj_radar()
         .args(["setup", "zellij", "--wasm", "/tmp/x.wasm", "--download", "--yes"])
         .env("ZELLIJ_CONFIG_DIR", config_dir.path())
         .assert();
@@ -214,8 +213,7 @@ fn interrupted_download_leaves_no_partial_wasm() {
         fs::set_permissions(&curl, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
-    Command::cargo_bin("zj-radar")
-        .unwrap()
+    zj_radar()
         .args(["setup", "zellij", "--download", "--yes"])
         .env("ZELLIJ_CONFIG_DIR", config_dir.path())
         .env("PATH", fakebin.path()) // only the fake curl is resolvable
@@ -288,8 +286,7 @@ fn checksum_mismatch_refuses_to_install_the_wasm() {
     // warning and the mismatch would never be caught (a different path).
     let path = format!("{}:{}", fakebin.path().display(), std::env::var("PATH").unwrap_or_default());
 
-    Command::cargo_bin("zj-radar")
-        .unwrap()
+    zj_radar()
         .args(["setup", "zellij", "--download", "--yes"])
         .env("ZELLIJ_CONFIG_DIR", config_dir.path())
         .env("PATH", path)
@@ -334,12 +331,7 @@ fn check_inspects_the_configs_default_layout_and_honors_layout_flag() {
         args.extend_from_slice(extra);
         // No `.success()`: the doctor exits non-zero when anything is Missing,
         // and this fixture has no wasm — the layout item is the subject here.
-        let output = Command::cargo_bin("zj-radar")
-            .unwrap()
-            .args(&args)
-            .env("ZELLIJ_CONFIG_DIR", config_dir.path())
-            .output()
-            .unwrap();
+        let output = zj_radar().args(&args).env("ZELLIJ_CONFIG_DIR", config_dir.path()).output().unwrap();
         String::from_utf8_lossy(&output.stdout).into_owned()
     };
 
@@ -367,8 +359,7 @@ fn check_inspects_the_configs_default_layout_and_honors_layout_flag() {
 /// can't leak in.
 fn bare_check(home: &TempDir, path: &std::ffi::OsStr) -> std::process::Output {
     let config_dir = TempDir::new().unwrap(); // empty: the zellij half is all Missing
-    Command::cargo_bin("zj-radar")
-        .unwrap()
+    zj_radar()
         .args(["setup", "--check"])
         .env("ZELLIJ_CONFIG_DIR", config_dir.path())
         .env("HOME", home.path())
@@ -382,6 +373,7 @@ fn bare_check(home: &TempDir, path: &std::ffi::OsStr) -> std::process::Output {
         .unwrap()
 }
 
+#[cfg(unix)]
 #[test]
 fn check_exit_code_gates_and_bare_check_covers_zellij_and_detected_codex() {
     let home = TempDir::new().unwrap();
@@ -418,8 +410,7 @@ fn bare_check_includes_a_path_less_pi_whose_bridge_is_installed() {
     let home = TempDir::new().unwrap();
     let empty_path = TempDir::new().unwrap();
     fs::create_dir_all(home.path().join(".pi/agent")).unwrap();
-    Command::cargo_bin("zj-radar")
-        .unwrap()
+    zj_radar()
         .args(["setup", "pi", "--yes"])
         .env("HOME", home.path())
         .env_remove("PI_CODING_AGENT_DIR")
@@ -442,8 +433,7 @@ fn bare_check_warns_not_fails_for_a_path_less_codex_whose_hooks_are_installed() 
     let empty_path = TempDir::new().unwrap();
     fs::create_dir_all(home.path().join(".codex")).unwrap();
     fs::write(home.path().join(".codex/hooks.json"), "{}").unwrap();
-    Command::cargo_bin("zj-radar")
-        .unwrap()
+    zj_radar()
         .args(["setup", "codex", "--yes"])
         .env("HOME", home.path())
         .env_remove("CODEX_HOME")
@@ -460,9 +450,10 @@ fn bare_check_warns_not_fails_for_a_path_less_codex_whose_hooks_are_installed() 
 // ── Codex --legacy-notify: detection, backup, and restore ─────────────────────
 
 fn codex_cmd(codex_home: &TempDir, args: &[&str]) -> assert_cmd::assert::Assert {
-    Command::cargo_bin("zj-radar").unwrap().args(args).env("CODEX_HOME", codex_home.path()).assert()
+    zj_radar().args(args).env("CODEX_HOME", codex_home.path()).assert()
 }
 
+#[cfg(unix)]
 #[test]
 fn bare_check_counts_a_legacy_notify_codex_as_a_wired_producer() {
     // `--legacy-notify` writes no hooks.json; the doctor must still see Codex
@@ -474,8 +465,7 @@ fn bare_check_counts_a_legacy_notify_codex_as_a_wired_producer() {
     shim.add_recorder("zj-radar");
     fs::create_dir_all(home.path().join(".codex")).unwrap();
     fs::write(home.path().join(".codex/config.toml"), "model = \"x\"\n").unwrap();
-    Command::cargo_bin("zj-radar")
-        .unwrap()
+    zj_radar()
         .args(["setup", "codex", "--legacy-notify", "-y"])
         .env("HOME", home.path())
         .env_remove("CODEX_HOME")
@@ -586,12 +576,7 @@ fn setup_zellij_inject_creates_full_layout_when_none_exists() {
     let config_dir = TempDir::new().unwrap(); // no layouts/ at all
     let layout_path = config_dir.path().join("layouts").join("default.kdl");
 
-    Command::cargo_bin("zj-radar")
-        .unwrap()
-        .args(["setup", "zellij", "--inject"])
-        .env("ZELLIJ_CONFIG_DIR", config_dir.path())
-        .assert()
-        .success();
+    zj_radar().args(["setup", "zellij", "--inject"]).env("ZELLIJ_CONFIG_DIR", config_dir.path()).assert().success();
 
     let created = fs::read_to_string(&layout_path).unwrap();
     assert!(created.contains("plugin location=\"radar\""), "created layout must carry the rail; got:\n{created}");
@@ -608,12 +593,8 @@ fn setup_zellij_yes_never_creates_a_layout_file() {
     let config_dir = TempDir::new().unwrap();
     let layout_path = config_dir.path().join("layouts").join("default.kdl");
 
-    let output = Command::cargo_bin("zj-radar")
-        .unwrap()
-        .args(["setup", "zellij", "--yes"])
-        .env("ZELLIJ_CONFIG_DIR", config_dir.path())
-        .output()
-        .unwrap();
+    let output =
+        zj_radar().args(["setup", "zellij", "--yes"]).env("ZELLIJ_CONFIG_DIR", config_dir.path()).output().unwrap();
 
     assert!(!layout_path.exists(), "--yes must not create files");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -628,12 +609,7 @@ fn setup_zellij_inject_writes_rail_and_bak() {
     let layout_path = config_dir.path().join("layouts").join("default.kdl");
     let bak_path = config_dir.path().join("layouts").join("default.kdl.zj-radar.bak");
 
-    Command::cargo_bin("zj-radar")
-        .unwrap()
-        .args(["setup", "zellij", "--inject"])
-        .env("ZELLIJ_CONFIG_DIR", config_dir.path())
-        .assert()
-        .success();
+    zj_radar().args(["setup", "zellij", "--inject"]).env("ZELLIJ_CONFIG_DIR", config_dir.path()).assert().success();
 
     let injected = fs::read_to_string(&layout_path).unwrap();
     assert!(injected.contains("// zj-radar:wrap begin"), "--inject must add the wrap begin marker; got:\n{injected}");
@@ -675,8 +651,7 @@ layout {
     let config_dir = isolated_zellij_config(layout_with_swaps);
     let layout_path = config_dir.path().join("layouts").join("default.kdl");
 
-    let output = Command::cargo_bin("zj-radar")
-        .unwrap()
+    let output = zj_radar()
         .args(["setup", "zellij", "--inject"])
         .env("ZELLIJ_CONFIG_DIR", config_dir.path())
         .assert()
@@ -709,8 +684,7 @@ fn setup_zellij_yes_without_inject_prints_snippet_and_does_not_modify() {
 
     // --yes without --inject: inject_mode → Snippet (safe default, never mutate).
     // Since there is no --wasm/--download, this takes the layout_only_install path.
-    let output = Command::cargo_bin("zj-radar")
-        .unwrap()
+    let output = zj_radar()
         .args(["setup", "zellij", "--yes"])
         .env("ZELLIJ_CONFIG_DIR", config_dir.path())
         .assert()
@@ -738,23 +712,13 @@ fn setup_zellij_uninstall_reverses_injection() {
     let config_dir = isolated_zellij_config(FIXTURE_LAYOUT);
     let layout_path = config_dir.path().join("layouts").join("default.kdl");
 
-    Command::cargo_bin("zj-radar")
-        .unwrap()
-        .args(["setup", "zellij", "--inject"])
-        .env("ZELLIJ_CONFIG_DIR", config_dir.path())
-        .assert()
-        .success();
+    zj_radar().args(["setup", "zellij", "--inject"]).env("ZELLIJ_CONFIG_DIR", config_dir.path()).assert().success();
 
     let injected = fs::read_to_string(&layout_path).unwrap();
     assert!(injected.contains("// zj-radar:wrap begin"), "prerequisite: inject must have written the rail");
 
     // Now uninstall (layout-only, no wasm config needed).
-    Command::cargo_bin("zj-radar")
-        .unwrap()
-        .args(["setup", "zellij", "--uninstall"])
-        .env("ZELLIJ_CONFIG_DIR", config_dir.path())
-        .assert()
-        .success();
+    zj_radar().args(["setup", "zellij", "--uninstall"]).env("ZELLIJ_CONFIG_DIR", config_dir.path()).assert().success();
 
     let after = fs::read_to_string(&layout_path).unwrap();
     assert!(
@@ -778,20 +742,10 @@ fn setup_zellij_uninstall_deletes_layout_setup_created_whole() {
     let config_dir = TempDir::new().unwrap(); // no layouts/: --inject creates whole
     let layout_path = config_dir.path().join("layouts").join("default.kdl");
 
-    Command::cargo_bin("zj-radar")
-        .unwrap()
-        .args(["setup", "zellij", "--inject"])
-        .env("ZELLIJ_CONFIG_DIR", config_dir.path())
-        .assert()
-        .success();
+    zj_radar().args(["setup", "zellij", "--inject"]).env("ZELLIJ_CONFIG_DIR", config_dir.path()).assert().success();
     assert!(layout_path.exists(), "prerequisite: --inject must have created the layout");
 
-    Command::cargo_bin("zj-radar")
-        .unwrap()
-        .args(["setup", "zellij", "--uninstall"])
-        .env("ZELLIJ_CONFIG_DIR", config_dir.path())
-        .assert()
-        .success();
+    zj_radar().args(["setup", "zellij", "--uninstall"]).env("ZELLIJ_CONFIG_DIR", config_dir.path()).assert().success();
 
     assert!(
         !layout_path.exists(),
@@ -810,20 +764,14 @@ fn setup_zellij_uninstall_advises_on_edited_whole_created_layout() {
     let config_dir = TempDir::new().unwrap();
     let layout_path = config_dir.path().join("layouts").join("default.kdl");
 
-    Command::cargo_bin("zj-radar")
-        .unwrap()
-        .args(["setup", "zellij", "--inject"])
-        .env("ZELLIJ_CONFIG_DIR", config_dir.path())
-        .assert()
-        .success();
+    zj_radar().args(["setup", "zellij", "--inject"]).env("ZELLIJ_CONFIG_DIR", config_dir.path()).assert().success();
 
     // A user edit: the file is no longer provably ours.
     let mut edited = fs::read_to_string(&layout_path).unwrap();
     edited.push_str("// my customization\n");
     fs::write(&layout_path, &edited).unwrap();
 
-    let output = Command::cargo_bin("zj-radar")
-        .unwrap()
+    let output = zj_radar()
         .args(["setup", "zellij", "--uninstall"])
         .env("ZELLIJ_CONFIG_DIR", config_dir.path())
         .assert()
@@ -852,8 +800,7 @@ fn setup_zellij_inject_dry_run_prints_and_does_not_write() {
     let layout_path = config_dir.path().join("layouts").join("default.kdl");
     let bak_path = config_dir.path().join("layouts").join("default.kdl.zj-radar.bak");
 
-    let output = Command::cargo_bin("zj-radar")
-        .unwrap()
+    let output = zj_radar()
         .args(["setup", "zellij", "--inject", "--dry-run"])
         .env("ZELLIJ_CONFIG_DIR", config_dir.path())
         .assert()
@@ -881,8 +828,7 @@ fn setup_zellij_inject_honors_a_default_layout_given_as_a_path() {
     let mine = elsewhere.path().join("mine.kdl");
     fs::write(&mine, FIXTURE_LAYOUT).unwrap();
     fs::write(config_dir.path().join("config.kdl"), format!("default_layout \"{}\"\n", mine.display())).unwrap();
-    let out = Command::cargo_bin("zj-radar")
-        .unwrap()
+    let out = zj_radar()
         .args(["setup", "zellij", "--inject", "-y"])
         .env("ZELLIJ_CONFIG_DIR", config_dir.path())
         .assert()
@@ -906,8 +852,7 @@ fn setup_zellij_inject_honors_layout_dir_for_a_named_layout() {
         format!("layout_dir \"{}\"\ndefault_layout \"main\"\n", layouts.path().display()),
     )
     .unwrap();
-    Command::cargo_bin("zj-radar")
-        .unwrap()
+    zj_radar()
         .args(["setup", "zellij", "--inject", "-y"])
         .env("ZELLIJ_CONFIG_DIR", config_dir.path())
         .assert()
@@ -949,8 +894,7 @@ fn setup_zellij_unchanged_arm_hints_producer_when_not_wired() {
     let home = TempDir::new().unwrap(); // empty HOME: no producer files at all
 
     let run = || {
-        Command::cargo_bin("zj-radar")
-            .unwrap()
+        zj_radar()
             .args(["setup", "zellij", "--wasm", wasm_path.to_str().unwrap(), "--yes"])
             .env("ZELLIJ_CONFIG_DIR", config_dir.path())
             .env("HOME", home.path())
@@ -982,16 +926,20 @@ fn setup_zellij_unchanged_arm_silent_when_producer_wired() {
     let (config_dir, wasm_dir) = isolated_zellij_install_env();
     let wasm_path = wasm_dir.path().join("zj_radar.wasm");
     let home = TempDir::new().unwrap();
-    let plugins_dir = home.path().join(".claude/plugins");
+    // Point producer detection with CLAUDE_CONFIG_DIR rather than HOME: it
+    // takes precedence over `dirs::home_dir()`, which on Windows resolves
+    // FOLDERID_Profile and ignores a HOME this test could set.
+    let claude_dir = home.path().join(".claude");
+    let plugins_dir = claude_dir.join("plugins");
     fs::create_dir_all(&plugins_dir).unwrap();
     fs::write(plugins_dir.join("installed_plugins.json"), r#"{"plugins":["zj-radar-claude"]}"#).unwrap();
 
     let run = || {
-        Command::cargo_bin("zj-radar")
-            .unwrap()
+        zj_radar()
             .args(["setup", "zellij", "--wasm", wasm_path.to_str().unwrap(), "--yes"])
             .env("ZELLIJ_CONFIG_DIR", config_dir.path())
             .env("HOME", home.path())
+            .env("CLAUDE_CONFIG_DIR", &claude_dir)
             .assert()
             .success()
             .get_output()
@@ -1049,12 +997,11 @@ fn setup_zellij_skips_grant_hint_when_already_granted() {
             )
             .unwrap();
         }
-        let output = Command::cargo_bin("zj-radar")
-            .unwrap()
+        let output = zj_radar()
             .args(["setup", "zellij", "--wasm", wasm_path.to_str().unwrap(), "--yes"])
             .env("ZELLIJ_CONFIG_DIR", config_dir.path())
             .env("HOME", home.path())
-            .env("XDG_CACHE_HOME", home.path().join(".cache"))
+            .env("ZJ_RADAR_CACHE_DIR", zellij_cache_dir(home.path()))
             .assert()
             .success()
             .get_output()
@@ -1089,13 +1036,44 @@ fn setup_zellij_skips_grant_hint_when_already_granted() {
 // refused (Zellij silently resets an unparseable file on its next write), and
 // dry-run announces without writing.
 
-/// Zellij's permissions.kdl under an isolated HOME, matching
-/// `run::permissions_path_in` per OS (tests set both HOME and XDG_CACHE_HOME).
+/// A `zj-radar` command that cannot touch the developer's real Zellij cache.
+///
+/// Every invocation in this file goes through here. `setup zellij --yes`
+/// pre-seeds a grant into Zellij's `permissions.kdl`, and the platform cache
+/// dir behind it is not redirectable everywhere — on Windows
+/// `dirs::cache_dir()` calls `SHGetKnownFolderPath`, which reads no
+/// environment variable, so `XDG_CACHE_HOME` isolates on Linux only. Without
+/// this default, running the suite rewrites live Zellij state.
+///
+/// Tests that assert on the pre-seeded file override `ZJ_RADAR_CACHE_DIR`
+/// with their own per-test root afterwards; the last `.env` wins.
+fn zj_radar() -> Command {
+    let sandbox = std::env::temp_dir().join("zj-radar-test-cache");
+    fs::create_dir_all(&sandbox).expect("the shared test cache sandbox must be creatable");
+    let mut cmd = Command::cargo_bin("zj-radar").unwrap();
+    cmd.env("ZJ_RADAR_CACHE_DIR", &sandbox);
+    cmd
+}
+
+/// The isolated Zellij cache root these tests point zj-radar at, via
+/// `ZJ_RADAR_CACHE_DIR`.
+///
+/// It names the cache ROOT (already past the per-OS layout arithmetic), so
+/// `permissions.kdl` sits directly inside and this helper needs no `cfg`.
+fn zellij_cache_dir(home: &std::path::Path) -> std::path::PathBuf {
+    home.join("zellij-cache")
+}
+
+/// How Zellij keys `wasm` in `permissions.kdl`: the plugin's URL path, which
+/// uses `/` on every host. Mirrors `run::permission_key` — a grant written
+/// with this OS's `\` would be a block Zellij never reads.
+fn permission_key(wasm: &std::path::Path) -> String {
+    wasm.display().to_string().replace('\\', "/")
+}
+
+/// Zellij's permissions.kdl under the isolated cache root.
 fn permissions_path(home: &std::path::Path) -> std::path::PathBuf {
-    #[cfg(target_os = "macos")]
-    return home.join("Library/Caches/org.Zellij-Contributors.Zellij/permissions.kdl");
-    #[cfg(not(target_os = "macos"))]
-    return home.join(".cache/zellij/permissions.kdl");
+    zellij_cache_dir(home).join("permissions.kdl")
 }
 
 /// One consented full install (`--wasm … --yes`) against isolated config,
@@ -1109,12 +1087,11 @@ fn preseed_install(seed_permissions: Option<&str>) -> (TempDir, TempDir, String,
         fs::create_dir_all(perms.parent().unwrap()).unwrap();
         fs::write(&perms, seed).unwrap();
     }
-    let output = Command::cargo_bin("zj-radar")
-        .unwrap()
+    let output = zj_radar()
         .args(["setup", "zellij", "--wasm", wasm_path.to_str().unwrap(), "--yes"])
         .env("ZELLIJ_CONFIG_DIR", config_dir.path())
         .env("HOME", home.path())
-        .env("XDG_CACHE_HOME", home.path().join(".cache"))
+        .env("ZJ_RADAR_CACHE_DIR", zellij_cache_dir(home.path()))
         .assert()
         .success()
         .get_output()
@@ -1135,7 +1112,7 @@ fn setup_zellij_preseeds_grant_on_install() {
     let perms =
         fs::read_to_string(permissions_path(home.path())).expect("a consented install must write permissions.kdl");
     assert!(
-        perms.contains(&format!("\"{}\"", wasm_dest.display())),
+        perms.contains(&format!("\"{}\"", permission_key(&wasm_dest))),
         "grant must be keyed by the absolute wasm destination:\n{perms}"
     );
     for perm in FULL_PERMISSION_SET {
@@ -1147,12 +1124,11 @@ fn setup_zellij_preseeds_grant_on_install() {
     );
 
     // The doctor reads the same file the same way: grant must now be ok.
-    let output = Command::cargo_bin("zj-radar")
-        .unwrap()
+    let output = zj_radar()
         .args(["setup", "zellij", "--check"])
         .env("ZELLIJ_CONFIG_DIR", config_dir.path())
         .env("HOME", home.path())
-        .env("XDG_CACHE_HOME", home.path().join(".cache"))
+        .env("ZJ_RADAR_CACHE_DIR", zellij_cache_dir(home.path()))
         .assert()
         .get_output()
         .clone();
@@ -1168,7 +1144,10 @@ fn setup_zellij_preseed_preserves_foreign_entries() {
 
     let perms = fs::read_to_string(permissions_path(home.path())).unwrap();
     assert!(perms.starts_with(foreign), "another plugin's grant must survive byte-for-byte:\n{perms}");
-    assert!(perms.contains(&format!("\"{}\"", wasm_dest.display())), "our grant must be appended alongside:\n{perms}");
+    assert!(
+        perms.contains(&format!("\"{}\"", permission_key(&wasm_dest))),
+        "our grant must be appended alongside:\n{perms}"
+    );
     // Zellij owns this file: the standard .bak restore point must exist.
     let bak = permissions_path(home.path()).with_file_name("permissions.kdl.zj-radar.bak");
     assert_eq!(
@@ -1200,12 +1179,11 @@ fn setup_zellij_dry_run_would_preseed_but_writes_nothing() {
     let (config_dir, wasm_dir) = isolated_zellij_install_env();
     let wasm_path = wasm_dir.path().join("zj_radar.wasm");
     let home = TempDir::new().unwrap();
-    let output = Command::cargo_bin("zj-radar")
-        .unwrap()
+    let output = zj_radar()
         .args(["setup", "zellij", "--wasm", wasm_path.to_str().unwrap(), "--dry-run"])
         .env("ZELLIJ_CONFIG_DIR", config_dir.path())
         .env("HOME", home.path())
-        .env("XDG_CACHE_HOME", home.path().join(".cache"))
+        .env("ZJ_RADAR_CACHE_DIR", zellij_cache_dir(home.path()))
         .assert()
         .success()
         .get_output()
@@ -1230,12 +1208,11 @@ fn setup_zellij_preseed_skipped_without_tty_falls_back_to_hint() {
         if yes {
             args.push("--yes");
         }
-        Command::cargo_bin("zj-radar")
-            .unwrap()
+        zj_radar()
             .args(&args)
             .env("ZELLIJ_CONFIG_DIR", config_dir.path())
             .env("HOME", home.path())
-            .env("XDG_CACHE_HOME", home.path().join(".cache"))
+            .env("ZJ_RADAR_CACHE_DIR", zellij_cache_dir(home.path()))
             .assert()
             .success()
             .get_output()
@@ -1274,8 +1251,7 @@ fn setup_zellij_never_writes_a_symlinked_layout() {
     std::os::unix::fs::symlink(&real, layouts.join("default.kdl")).unwrap();
 
     // Inject: refusal + snippet, symlink and target intact.
-    let output = Command::cargo_bin("zj-radar")
-        .unwrap()
+    let output = zj_radar()
         .args(["setup", "zellij", "--inject"])
         .env("ZELLIJ_CONFIG_DIR", config_dir.path())
         .assert()
@@ -1297,8 +1273,7 @@ fn setup_zellij_never_writes_a_symlinked_layout() {
     assert_eq!(fs::read_to_string(&real).unwrap(), FIXTURE_LAYOUT, "the symlink target must be untouched");
 
     // Uninstall: same guard (no config.kdl → the layout-only uninstall path).
-    let output = Command::cargo_bin("zj-radar")
-        .unwrap()
+    let output = zj_radar()
         .args(["setup", "zellij", "--uninstall"])
         .env("ZELLIJ_CONFIG_DIR", config_dir.path())
         .assert()
@@ -1334,8 +1309,7 @@ fn setup_zellij_refuses_an_unreadable_layout_instead_of_recreating_it() {
     fs::write(&layout_path, non_utf8).unwrap();
 
     // Inject: must NOT take the create path (which would replace the file).
-    let output = Command::cargo_bin("zj-radar")
-        .unwrap()
+    let output = zj_radar()
         .args(["setup", "zellij", "--inject"])
         .env("ZELLIJ_CONFIG_DIR", config_dir.path())
         .assert()
@@ -1350,8 +1324,7 @@ fn setup_zellij_refuses_an_unreadable_layout_instead_of_recreating_it() {
     assert_eq!(fs::read(&layout_path).unwrap(), non_utf8, "--inject must leave an unreadable layout byte-identical");
 
     // Uninstall: same discrimination (unreadable != nothing to uninstall).
-    let output = Command::cargo_bin("zj-radar")
-        .unwrap()
+    let output = zj_radar()
         .args(["setup", "zellij", "--uninstall"])
         .env("ZELLIJ_CONFIG_DIR", config_dir.path())
         .assert()
@@ -1373,8 +1346,7 @@ fn setup_zellij_dry_run_download_skips_the_fetch_and_writes_nothing() {
     let config_dir = TempDir::new().unwrap();
     let emptybin = TempDir::new().unwrap(); // no curl/wget: a fetch attempt would fail
 
-    let output = Command::cargo_bin("zj-radar")
-        .unwrap()
+    let output = zj_radar()
         .args(["setup", "zellij", "--download", "--dry-run"])
         .env("ZELLIJ_CONFIG_DIR", config_dir.path())
         .env("PATH", emptybin.path()) // offline-equivalent: success proves no fetch
@@ -1398,13 +1370,7 @@ fn setup_zellij_dry_run_download_skips_the_fetch_and_writes_nothing() {
 
 #[test]
 fn setup_check_conflicts_with_uninstall() {
-    let output = Command::cargo_bin("zj-radar")
-        .unwrap()
-        .args(["setup", "--check", "--uninstall"])
-        .assert()
-        .failure()
-        .get_output()
-        .clone();
+    let output = zj_radar().args(["setup", "--check", "--uninstall"]).assert().failure().get_output().clone();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     assert!(
         stderr.contains("cannot be used with"),
@@ -1424,7 +1390,7 @@ fn check_warns_when_zellij_config_file_points_elsewhere() {
     let resolved = config_dir.path().join("config.kdl");
 
     let check = |config_file: Option<&std::path::Path>| -> String {
-        let mut cmd = Command::cargo_bin("zj-radar").unwrap();
+        let mut cmd = zj_radar();
         cmd.args(["setup", "zellij", "--check"])
             .env("ZELLIJ_CONFIG_DIR", config_dir.path())
             .env_remove("ZELLIJ_CONFIG_FILE");
@@ -1472,17 +1438,21 @@ fn claude_home(wired: bool) -> TempDir {
     home
 }
 
+/// The `claude` shims below are POSIX `#!/bin/sh` recorders on PATH, so every
+/// test that asserts what `setup claude` INVOKED is unix-only. The tests that
+/// only assert what it WROTE stay portable.
+#[cfg(unix)]
 fn claude_args(shim: &ShimDir) -> Vec<String> {
     shim.recorded("claude").into_iter().map(|r| r.args.join(" ")).collect()
 }
 
+#[cfg(unix)]
 #[test]
 fn setup_claude_installs_via_the_plugin_cli() {
     let shim = ShimDir::new();
     shim.add_recorder("claude");
     let home = claude_home(false);
-    let output = Command::cargo_bin("zj-radar")
-        .unwrap()
+    let output = zj_radar()
         .args(["setup", "claude", "--yes"])
         .env("PATH", shim.path_env())
         .env("HOME", home.path())
@@ -1502,13 +1472,13 @@ fn setup_claude_installs_via_the_plugin_cli() {
     assert!(stdout.contains("claude: installed"), "stdout:\n{stdout}");
 }
 
+#[cfg(unix)]
 #[test]
 fn setup_claude_already_wired_is_a_no_op() {
     let shim = ShimDir::new();
     shim.add_recorder("claude");
     let home = claude_home(true);
-    let output = Command::cargo_bin("zj-radar")
-        .unwrap()
+    let output = zj_radar()
         .args(["setup", "claude", "--yes"])
         .env("PATH", shim.path_env())
         .env("HOME", home.path())
@@ -1521,13 +1491,13 @@ fn setup_claude_already_wired_is_a_no_op() {
     assert!(stdout.contains("already wired"), "stdout:\n{stdout}");
 }
 
+#[cfg(unix)]
 #[test]
 fn setup_claude_dry_run_runs_nothing() {
     let shim = ShimDir::new();
     shim.add_recorder("claude");
     let home = claude_home(false);
-    let output = Command::cargo_bin("zj-radar")
-        .unwrap()
+    let output = zj_radar()
         .args(["setup", "claude", "--dry-run"])
         .env("PATH", shim.path_env())
         .env("HOME", home.path())
@@ -1543,13 +1513,13 @@ fn setup_claude_dry_run_runs_nothing() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn setup_claude_uninstall_runs_plugin_uninstall() {
     let shim = ShimDir::new();
     shim.add_recorder("claude");
     let home = claude_home(true);
-    Command::cargo_bin("zj-radar")
-        .unwrap()
+    zj_radar()
         .args(["setup", "claude", "--uninstall", "--yes"])
         .env("PATH", shim.path_env())
         .env("HOME", home.path())
@@ -1562,6 +1532,7 @@ fn setup_claude_uninstall_runs_plugin_uninstall() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn claude_check_passes_a_path_less_claude_whose_plugin_is_installed() {
     // Claude Code's local install is an alias to ~/.claude/local/claude,
@@ -1570,8 +1541,7 @@ fn claude_check_passes_a_path_less_claude_whose_plugin_is_installed() {
     let home = claude_home(true);
     let shim = ShimDir::new();
     shim.add_recorder("zj-radar");
-    let out = Command::cargo_bin("zj-radar")
-        .unwrap()
+    let out = zj_radar()
         .args(["setup", "claude", "--check"])
         .env("HOME", home.path())
         .env_remove("CLAUDE_CONFIG_DIR")
@@ -1592,8 +1562,7 @@ fn claude_check_passes_a_path_less_claude_whose_plugin_is_installed() {
 fn setup_claude_skips_when_binary_missing() {
     let empty_path = TempDir::new().unwrap();
     let home = claude_home(false);
-    let output = Command::cargo_bin("zj-radar")
-        .unwrap()
+    let output = zj_radar()
         .args(["setup", "claude", "--yes"])
         .env("PATH", empty_path.path())
         .env("HOME", home.path())
@@ -1608,6 +1577,7 @@ fn setup_claude_skips_when_binary_missing() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn claude_detection_honors_claude_config_dir() {
     // The plugin manifest lives under `$CLAUDE_CONFIG_DIR` when set, not
@@ -1618,8 +1588,7 @@ fn claude_detection_honors_claude_config_dir() {
     let config = TempDir::new().unwrap();
     fs::create_dir_all(config.path().join("plugins")).unwrap();
     fs::write(config.path().join("plugins/installed_plugins.json"), r#"{"plugins":["zj-radar-claude"]}"#).unwrap();
-    let output = Command::cargo_bin("zj-radar")
-        .unwrap()
+    let output = zj_radar()
         .args(["setup", "claude", "--check"])
         .env("PATH", shim.path_env())
         .env("HOME", home.path())
@@ -1632,6 +1601,7 @@ fn claude_detection_honors_claude_config_dir() {
     assert!(stdout.contains("ok plugin: zj-radar-claude plugin installed"), "stdout:\n{stdout}");
 }
 
+#[cfg(unix)]
 #[test]
 fn setup_claude_without_consent_runs_nothing() {
     // Piped stdin means no tty at the boundary probe, so `confirm` takes the
@@ -1641,8 +1611,7 @@ fn setup_claude_without_consent_runs_nothing() {
     let shim = ShimDir::new();
     shim.add_recorder("claude");
     let home = claude_home(false);
-    let output = Command::cargo_bin("zj-radar")
-        .unwrap()
+    let output = zj_radar()
         .args(["setup", "claude"])
         .env("PATH", shim.path_env())
         .env("HOME", home.path())
@@ -1669,12 +1638,11 @@ fn setup_zellij_uninstall_deletes_a_v013_authored_layout() {
     let wasm_path = wasm_dir.path().join("zj_radar.wasm");
     let home = TempDir::new().unwrap();
     let run = |args: &[&str]| {
-        Command::cargo_bin("zj-radar")
-            .unwrap()
+        zj_radar()
             .args(args)
             .env("ZELLIJ_CONFIG_DIR", config_dir.path())
             .env("HOME", home.path())
-            .env("XDG_CACHE_HOME", home.path().join(".cache"))
+            .env("ZJ_RADAR_CACHE_DIR", zellij_cache_dir(home.path()))
             .assert()
             .success();
     };
@@ -1699,12 +1667,11 @@ fn setup_zellij_yes_preseeds_when_wasm_already_installed() {
     let wasm_path = wasm_dir.path().join("zj_radar.wasm");
     let home = TempDir::new().unwrap();
     let run = |args: &[&str]| {
-        Command::cargo_bin("zj-radar")
-            .unwrap()
+        zj_radar()
             .args(args)
             .env("ZELLIJ_CONFIG_DIR", config_dir.path())
             .env("HOME", home.path())
-            .env("XDG_CACHE_HOME", home.path().join(".cache"))
+            .env("ZJ_RADAR_CACHE_DIR", zellij_cache_dir(home.path()))
             .assert()
             .success();
     };
@@ -1728,12 +1695,11 @@ fn setup_zellij_dry_run_never_contradicts_itself_about_the_grant() {
     let run = |extra: &[&str]| {
         let mut args = vec!["setup", "zellij", "--wasm", wasm_path.to_str().unwrap(), "--yes"];
         args.extend_from_slice(extra);
-        Command::cargo_bin("zj-radar")
-            .unwrap()
+        zj_radar()
             .args(&args)
             .env("ZELLIJ_CONFIG_DIR", config_dir.path())
             .env("HOME", home.path())
-            .env("XDG_CACHE_HOME", home.path().join(".cache"))
+            .env("ZJ_RADAR_CACHE_DIR", zellij_cache_dir(home.path()))
             .assert()
             .success()
             .get_output()
@@ -1766,12 +1732,14 @@ const OPENCODE_TUI_MARKER: &str = "ZJ_RADAR_OPENCODE_PLUGIN=v2";
 fn isolated_opencode_xdg() -> (TempDir, std::path::PathBuf) {
     let xdg = TempDir::new().unwrap();
     fs::create_dir_all(xdg.path().join("opencode")).unwrap();
-    let plugin = xdg.path().join("opencode/plugins/zj-radar.js");
+    // Per component — see `isolated_pi_home` on why a "a/b/c" literal breaks
+    // the `display()` comparisons against the CLI's own output on Windows.
+    let plugin = xdg.path().join("opencode").join("plugins").join("zj-radar.js");
     (xdg, plugin)
 }
 
 fn opencode_tui_plugin(xdg: &TempDir) -> std::path::PathBuf {
-    xdg.path().join("opencode/plugins/zj-radar/tui.js")
+    xdg.path().join("opencode").join("plugins").join("zj-radar").join("tui.js")
 }
 
 fn opencode_cmd(xdg: &TempDir, args: &[&str]) -> assert_cmd::assert::Assert {
@@ -1779,8 +1747,7 @@ fn opencode_cmd(xdg: &TempDir, args: &[&str]) -> assert_cmd::assert::Assert {
     // `opencode` (or `zj-radar`) on the host PATH would flip check_opencode's
     // binary items from Missing to Ok, which these tests assume won't happen.
     let empty_path = TempDir::new().unwrap();
-    Command::cargo_bin("zj-radar")
-        .unwrap()
+    zj_radar()
         .args(["setup", "opencode"])
         .args(args)
         .env("XDG_CONFIG_HOME", xdg.path())
@@ -1858,10 +1825,7 @@ fn setup_opencode_refuses_a_foreign_plugin_unless_forced() {
     assert_eq!(fs::read_to_string(&bak).unwrap(), "export const Other = async () => ({});\n");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains(&format!("left {}", bak.display())), "stdout:\n{stdout}");
-    assert!(
-        stdout.contains(&format!("`mv {} {}` to restore it", bak.display(), plugin.display())),
-        "stdout:\n{stdout}"
-    );
+    assert_restore_hint(&stdout, &bak, &plugin);
 }
 
 #[test]
@@ -1875,7 +1839,9 @@ fn setup_opencode_refuses_a_foreign_tui_plugin_unless_forced() {
 
     let out = opencode_cmd(&xdg, &["--yes"]).failure().get_output().clone();
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("zj-radar/tui.js"), "stderr:\n{stderr}");
+    // The refusal names the offending path; compare against the real one
+    // rather than a `zj-radar/tui.js` literal, whose separator is the host's.
+    assert!(stderr.contains(&tui.display().to_string()), "stderr:\n{stderr}");
     assert!(!plugin.exists(), "a refusal is all-or-nothing: the 1.x bridge is not written either");
 
     opencode_cmd(&xdg, &["--yes", "--force"]).success();
@@ -1967,15 +1933,18 @@ const PI_MARKER: &str = "ZJ_RADAR_PI_EXTENSION=v1";
 
 fn isolated_pi_home() -> (TempDir, std::path::PathBuf) {
     let home = TempDir::new().unwrap();
-    fs::create_dir_all(home.path().join(".pi/agent")).unwrap();
-    let ext = home.path().join(".pi/agent/extensions/zj-radar.js");
+    // Joined per component, not as one "a/b/c" literal: on Windows `join`
+    // keeps an embedded `/` verbatim, and the resulting mixed-separator path
+    // would never equal the all-backslash one the CLI prints.
+    let agent = home.path().join(".pi").join("agent");
+    fs::create_dir_all(&agent).unwrap();
+    let ext = agent.join("extensions").join("zj-radar.js");
     (home, ext)
 }
 
 fn pi_cmd(home: &TempDir, args: &[&str]) -> assert_cmd::assert::Assert {
     let empty_path = TempDir::new().unwrap();
-    Command::cargo_bin("zj-radar")
-        .unwrap()
+    zj_radar()
         .args(["setup", "pi"])
         .args(args)
         .env("HOME", home.path())
@@ -2002,8 +1971,7 @@ fn setup_pi_installs_the_marked_extension_and_is_idempotent() {
 fn setup_pi_honors_pi_coding_agent_dir_with_tilde() {
     let (home, default_ext) = isolated_pi_home();
     let empty_path = TempDir::new().unwrap();
-    Command::cargo_bin("zj-radar")
-        .unwrap()
+    zj_radar()
         .args(["setup", "pi", "--yes"])
         .env("HOME", home.path())
         .env("PI_CODING_AGENT_DIR", "~/custom-pi")
@@ -2022,8 +1990,7 @@ fn setup_pi_honors_an_explicit_override_before_its_dir_exists() {
     let home = TempDir::new().unwrap();
     let empty_path = TempDir::new().unwrap();
     let fresh = home.path().join("fresh-pi");
-    Command::cargo_bin("zj-radar")
-        .unwrap()
+    zj_radar()
         .args(["setup", "pi", "--yes"])
         .env("HOME", home.path())
         .env("PI_CODING_AGENT_DIR", &fresh)
@@ -2096,8 +2063,7 @@ fn setup_pi_uninstall_keeps_the_backup_of_a_forced_over_foreign_file() {
     assert_eq!(fs::read_to_string(&bak).unwrap(), theirs, "the foreign backup survives");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains(&format!("left {}", bak.display())), "the kept backup is mentioned:\n{stdout}");
-    let restore = format!("`mv {} {}` to restore it", bak.display(), ext.display());
-    assert!(stdout.contains(&restore), "the restore command is spelled out:\n{stdout}");
+    assert_restore_hint(&stdout, &bak, &ext);
 }
 
 #[test]
@@ -2110,7 +2076,8 @@ fn setup_pi_uninstall_dry_run_names_our_backup_it_would_remove() {
 
     let out = pi_cmd(&home, &["--uninstall", "--dry-run"]).success().get_output().clone();
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains(&format!("would remove {} (dry-run)", bak.display())), "stdout:\n{stdout}");
+    let want = format!("would remove {} (dry-run)", bak.display());
+    assert!(stdout.contains(&want), "want:\n{want}\ngot stdout:\n{stdout}");
     assert!(bak.exists(), "dry-run removes nothing");
 }
 
@@ -2179,8 +2146,7 @@ fn setup_pi_check_reports_missing_then_ok() {
 // --download" upgraded nothing.
 
 fn setup_zellij_wasm(config_dir: &TempDir, wasm: &std::path::Path) -> assert_cmd::assert::Assert {
-    Command::cargo_bin("zj-radar")
-        .unwrap()
+    zj_radar()
         .args(["setup", "zellij", "--wasm"])
         .arg(wasm)
         .arg("--yes")

@@ -1,3 +1,10 @@
+//! Unix-only, in full: every test here drives `notify`'s send through a
+//! `#!/bin/sh` recorder shim placed on PATH, and the behaviour under test is
+//! the POSIX wrapper's (`sh -c`, the in-subtree watchdog, signal reaping).
+//! Windows has no shebang mechanism, so there is no shim to intercept with
+//! and nothing these tests could assert there.
+#![cfg(unix)]
+
 mod support;
 use assert_cmd::Command;
 use support::ShimDir;
