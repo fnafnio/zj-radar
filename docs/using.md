@@ -181,7 +181,8 @@ or `pending`. Defaults:
 - Acknowledging a row with `✓` never notifies.
 - Delivery uses `osascript` on macOS and `notify-send` on Linux. Without either
   on `PATH`, or without the `RunCommands` permission, notifications are
-  silently skipped and everything else works.
+  silently skipped and everything else works. Set `notify_command` to deliver
+  through your own program instead (e.g. to a phone or a remote terminal).
 
 Turn them off with `notify false`, or per status with `notify_done`,
 `notify_error`, and `notify_pending`. A remote session's disconnect has its

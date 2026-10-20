@@ -197,6 +197,11 @@ pub struct Config {
     /// disconnects (`notify_rules::enabled`).
     pub notify_remote: bool,
     pub notify_when_focused: bool,
+    /// Program (plus fixed leading args, whitespace-separated) run instead of
+    /// the built-in `osascript`/`notify-send` dispatch; the notification's
+    /// title and body are appended as its last two arguments. Empty (the
+    /// default) keeps the built-in dispatch.
+    pub notify_command: Vec<String>,
     /// Expand the cross-session badge into a session tree: each peer's tabs
     /// and agent rows under its heading (`render::render_peer_children`).
     /// Opt-in: off keeps the compact one-line-per-session badge and publishes
@@ -238,6 +243,7 @@ impl Default for Config {
             notify_pending: true,
             notify_remote: true,
             notify_when_focused: false,
+            notify_command: Vec::new(),
             session_tree: false,
             show_mode: false,
             spinner_fps: DEFAULT_SPINNER_FPS,
@@ -263,6 +269,12 @@ fn parse_bool(v: &str) -> Option<bool> {
 /// (an empty value is a valid "no extras", so a live override can clear the
 /// list); entries are trimmed with any login-shell `-` prefix stripped, and
 /// empties dropped.
+/// A whitespace-separated argv. Blank yields an empty argv (the "unset" value),
+/// so `notify_command ""` restores the built-in default.
+fn parse_argv(v: &str) -> Option<Vec<String>> {
+    Some(v.split_whitespace().map(str::to_string).collect())
+}
+
 fn parse_name_set(v: &str) -> Option<BTreeSet<String>> {
     Some(
         v.split([',', ' ', '\t'])
@@ -339,6 +351,7 @@ config_fields! {
     notify_pending:      "notify_pending"      => parse_bool,
     notify_remote:       "notify_remote"       => parse_bool,
     notify_when_focused: "notify_when_focused" => parse_bool,
+    notify_command:      "notify_command"      => parse_argv,
     session_tree:        "session_tree"        => parse_bool,
     show_mode:           "show_mode"           => parse_bool,
     spinner_fps:         "spinner_fps"         => parse_fps,
@@ -645,6 +658,14 @@ mod tests {
         assert!(!c.notify_pending);
         assert!(!c.notify_remote);
         assert!(c.notify_when_focused);
+    }
+
+    #[test]
+    fn notify_command_splits_on_whitespace_and_blank_unsets() {
+        assert!(Config::default().notify_command.is_empty());
+        let c = Config::from_map(&map(&[("notify_command", " /bin/notify-phone  --urgent ")]));
+        assert_eq!(c.notify_command, ["/bin/notify-phone", "--urgent"]);
+        assert!(Config::from_map(&map(&[("notify_command", "  ")])).notify_command.is_empty());
     }
 
     #[test]

@@ -241,7 +241,7 @@ impl State {
                     // same event; the shared claim file elects exactly one
                     // dispatcher so N visited tabs ≠ N identical toasts.
                     if self.session_files.claim_notification(&key) {
-                        let argv = crate::notify_rules::notify_command(&title, &body);
+                        let argv = crate::notify_rules::notify_command(self.runtime.notify_command(), &title, &body);
                         let args: Vec<&str> = argv.iter().map(String::as_str).collect();
                         run_command(&args, std::collections::BTreeMap::new());
                     }

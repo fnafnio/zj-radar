@@ -130,7 +130,13 @@ pub fn status_map(current: &BTreeMap<u32, &TrackedObservation>) -> BTreeMap<u32,
 /// and cannot break out of the command. `osascript` receives them as its own
 /// `argv` (`on run argv`) for the same reason — retiring the old hand-rolled
 /// AppleScript string escaper. The `--` guards a title/body that begins with `-`.
-pub fn notify_command(title: &str, body: &str) -> Vec<String> {
+///
+/// A non-empty `custom` argv (the `notify_command` option) replaces the
+/// dispatch: title and body are appended to it as plain arguments.
+pub fn notify_command(custom: &[String], title: &str, body: &str) -> Vec<String> {
+    if !custom.is_empty() {
+        return custom.iter().cloned().chain([title.to_string(), body.to_string()]).collect();
+    }
     // $0 is a label; $1 = title, $2 = body.
     const DISPATCH: &str = concat!(
         "if command -v osascript >/dev/null 2>&1; then ",
@@ -366,7 +372,7 @@ mod tests {
 
     #[test]
     fn notify_command_dispatches_both_backends_with_positional_args() {
-        let argv = notify_command("pinky · main", "done — build");
+        let argv = notify_command(&[], "pinky · main", "done — build");
         assert_eq!(argv[0], "sh");
         assert_eq!(argv[1], "-c");
         // The host script tries macOS first, then the Linux fallback.
@@ -384,11 +390,18 @@ mod tests {
         // never spliced into the script, so nothing can inject into or break out
         // of the command (the reason the old string-literal escaper is gone). The
         // `--` in the script is what protects a leading-dash title/body.
-        let argv = notify_command("-rf \"$(reboot)\"", "a\\b\" ; rm -rf /");
+        let argv = notify_command(&[], "-rf \"$(reboot)\"", "a\\b\" ; rm -rf /");
         assert_eq!(argv[4], "-rf \"$(reboot)\"");
         assert_eq!(argv[5], "a\\b\" ; rm -rf /");
         // The payload text never appears in the script body itself.
         assert!(!argv[2].contains("reboot"));
         assert!(!argv[2].contains("rm -rf"));
+    }
+
+    #[test]
+    fn custom_notify_command_gets_title_and_body_appended() {
+        let custom = vec!["/usr/local/bin/notify-phone".to_string(), "--urgent".to_string()];
+        let argv = notify_command(&custom, "pinky · main", "-waiting");
+        assert_eq!(argv, ["/usr/local/bin/notify-phone", "--urgent", "pinky · main", "-waiting"]);
     }
 }

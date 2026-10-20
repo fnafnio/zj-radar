@@ -1653,6 +1653,11 @@ impl PluginRuntime {
     /// an attention edge has landed that a settle tick hasn't carried yet. Reads
     /// the exact baseline [`notify_effects`](Self::notify_effects) advances, so it
     /// goes quiet precisely when the deferred recede + notify are done.
+    /// The configured `notify_command` argv (empty = built-in dispatch).
+    pub fn notify_command(&self) -> &[String] {
+        &self.config.notify_command
+    }
+
     fn has_unsettled_notifications(&self) -> bool {
         crate::notify_rules::status_map(&self.radar.notify_views()) != self.notify_prev
     }
