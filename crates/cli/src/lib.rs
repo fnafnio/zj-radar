@@ -1,11 +1,11 @@
 //! Native CLI (`zj-radar`): the host front door for the sidebar.
 //!
-//! Four subcommands, one per module:
+//! Five subcommands, one per module:
 //! - `notify <agent>` ([`notify`]) — the *pushed* information source. Reads an
 //!   agent's hook payload and broadcasts a `zj_radar.status.v1` update. Each
 //!   agent is a peer adapter behind the [`agents::Agent::derive`] seam, so
 //!   `notify` stays agent-agnostic.
-//! - `setup [claude|codex|opencode|pi|zellij]` ([`setup`]) — idempotent
+//! - `setup [claude|codex|opencode|pi|omp|zellij]` ([`setup`]) — idempotent
 //!   wiring: manage Codex notify/`hooks.json`, drop the opencode JS bridge
 //!   plugin and the pi bridge extension into their auto-loaded dirs, install
 //!   the wasm plugin, and inject the rail into a Zellij layout ([`layout`]).
@@ -14,6 +14,7 @@
 //! - `update` ([`update`]) — move the CLI and the sidebar wasm to a newer
 //!   release together (self-replace, then re-exec `setup zellij --download`);
 //!   hands Nix/cargo-managed binaries back to their package manager.
+//! - `state` ([`state`]) — read-only view of every live session's presence file, for scripts.
 
 // Re-export the shared core so the CLI submodules keep addressing these as
 // `crate::status`, `crate::payload`, … with no per-reference churn.
@@ -29,6 +30,7 @@ use std::path::PathBuf;
 pub(crate) const WASM_FILE_NAME: &str = "zj_radar.wasm";
 
 mod agents;
+mod codex_daemon;
 mod dedup;
 mod fsutil;
 mod git;
@@ -37,6 +39,7 @@ mod notify;
 mod producers;
 mod run;
 mod setup;
+mod state;
 mod update;
 
 /// Process-wide failure flag. The setup/run orchestrators report refusals and
@@ -82,7 +85,7 @@ struct Cli {
 enum Command {
     /// Broadcast one agent's status to the sidebar (called from an agent hook).
     Notify {
-        /// Which agent is reporting: `claude`, `codex`, `opencode`, `pi`, or
+        /// Which agent is reporting: `claude`, `codex`, `opencode`, `pi`, `omp`, or
         /// `generic` (any script — pass explicit `--status`/`--msg`/`--task`
         /// flags, no hook payload needed).
         agent: String,
@@ -117,7 +120,7 @@ enum Command {
     },
     /// Idempotently wire installed agents and Zellij to use zj-radar.
     Setup {
-        /// Targets to set up (default: detected agents only). Supported: claude, codex, opencode, pi, zellij.
+        /// Targets to set up (default: detected agents only). Supported: claude, codex, opencode, pi, omp, zellij.
         targets: Vec<String>,
         /// Wasm artifact to install when setting up Zellij.
         #[arg(long, value_name = "PATH")]
@@ -171,6 +174,22 @@ enum Command {
         /// exits non-zero when one is.
         #[arg(long)]
         check: bool,
+    },
+    /// Print what the radar knows: live sessions, tabs, and tracked panes,
+    /// read from the rails' presence files (never queries Zellij).
+    State {
+        /// Machine-readable JSON (`{"v":1,"sessions":[…]}`).
+        #[arg(long)]
+        json: bool,
+        /// Only agent panes that need you (pending or error); exits 1 if none.
+        #[arg(long)]
+        needs_attention: bool,
+        /// With --needs-attention, also consider stale sessions (no heartbeat for >90s).
+        #[arg(long, requires = "needs_attention")]
+        include_stale: bool,
+        /// Only this session.
+        #[arg(long, value_name = "NAME")]
+        session: Option<String>,
     },
 }
 
@@ -233,6 +252,9 @@ pub fn run() -> std::process::ExitCode {
         }
         Command::Update { check } => {
             update::run(update::UpdateOptions { check });
+        }
+        Command::State { json, needs_attention, include_stale, session } => {
+            return state::run(state::StateOptions { json, needs_attention, include_stale, session });
         }
     }
     if exit::failed() {

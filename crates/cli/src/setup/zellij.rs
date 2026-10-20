@@ -462,7 +462,16 @@ pub(crate) fn setup_zellij(uninstall: bool, opts: ZellijSetupOpts<'_>) {
                 crate::fsutil::atomic_write(&wasm_dest, &bytes).map_err(|e| format!("wasm copy failed — {e}"))?;
                 Ok(())
             };
-            if !confirm_and_write("zellij", &config_path, &new, yes, is_tty, &prompt, copy_wasm) {
+            // The fail-when-named rule (`report_declined`) covers the agent
+            // targets; zellij's consent chain keeps its quiet decline.
+            if !confirm_and_write(
+                "zellij",
+                &config_path,
+                &new,
+                Consent { yes, is_tty, explicit: false },
+                &prompt,
+                copy_wasm,
+            ) {
                 return;
             }
             println!("zellij: {} ({})", if uninstall { "removed" } else { "installed" }, config_path.display());

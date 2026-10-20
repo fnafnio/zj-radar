@@ -56,26 +56,25 @@ fn claude_config_dir_from(
     home.filter(|h| !h.as_os_str().is_empty()).map(|h| h.join(".claude"))
 }
 
-pub(crate) fn setup_claude(uninstall: bool, dry_run: bool, yes: bool, is_tty: bool) {
+pub(crate) fn setup_claude(uninstall: bool, explicit: bool, dry_run: bool, yes: bool, is_tty: bool) {
     let wired = crate::producers::ProducerTexts::read().is_wired(crate::agents::Agent::Claude);
     if uninstall {
-        uninstall_claude(wired, dry_run, yes, is_tty);
+        uninstall_claude(wired, explicit, dry_run, yes, is_tty);
     } else {
-        install_claude(wired, dry_run, yes, is_tty);
+        install_claude(wired, explicit, dry_run, yes, is_tty);
     }
 }
 
-fn install_claude(wired: bool, dry_run: bool, yes: bool, is_tty: bool) {
+fn install_claude(wired: bool, explicit: bool, dry_run: bool, yes: bool, is_tty: bool) {
     if wired {
         println!("claude: already wired ({CLAUDE_PLUGIN} plugin installed)");
         return;
     }
     if !which("claude") {
-        // Mirrors codex's "skipped (binary/config not found)": a machine
-        // without the agent is not an error — bare `setup` reaches here for
-        // every detected-or-not agent.
-        println!("claude: skipped (binary not found)");
-        return;
+        // Mirrors codex's "skipped (binary/config not found)": bare `setup`
+        // reaches here for every detected-or-not agent, so only a named
+        // target fails on it.
+        return report_skip("claude", "binary not found", explicit);
     }
     let marketplace = repo_slug();
     let plugin_id = claude_plugin_id();
@@ -92,8 +91,7 @@ fn install_claude(wired: bool, dry_run: bool, yes: bool, is_tty: bool) {
         yes,
         is_tty,
     ) {
-        println!("claude: skipped (declined)");
-        return;
+        return report_declined("claude", is_tty, explicit);
     }
     // Adding an already-configured marketplace may fail depending on the
     // Claude Code version — not worth parsing; the install below is the step
@@ -111,7 +109,7 @@ fn install_claude(wired: bool, dry_run: bool, yes: bool, is_tty: bool) {
     );
 }
 
-fn uninstall_claude(wired: bool, dry_run: bool, yes: bool, is_tty: bool) {
+fn uninstall_claude(wired: bool, explicit: bool, dry_run: bool, yes: bool, is_tty: bool) {
     if !wired {
         println!("claude: already removed ({CLAUDE_PLUGIN} plugin not installed)");
         return;
@@ -133,8 +131,7 @@ fn uninstall_claude(wired: bool, dry_run: bool, yes: bool, is_tty: bool) {
         return;
     }
     if !confirm(&format!("Uninstall the {CLAUDE_PLUGIN} plugin via `claude plugin uninstall`?"), yes, is_tty) {
-        println!("claude: skipped (declined)");
-        return;
+        return report_declined("claude", is_tty, explicit);
     }
     if let Err(e) = run_claude(&["plugin", "uninstall", &plugin_id]) {
         crate::exit::fail_report("claude", format!("plugin uninstall failed — {e}"));

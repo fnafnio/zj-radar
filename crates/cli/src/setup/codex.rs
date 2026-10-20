@@ -68,19 +68,18 @@ pub(crate) fn setup_codex(uninstall: bool, opts: CodexSetupOpts) {
         return;
     }
     if opts.legacy_notify {
-        setup_codex_notify(uninstall, opts.dry_run, opts.yes, opts.force, opts.is_tty);
+        setup_codex_notify(uninstall, opts.explicit, opts.dry_run, opts.yes, opts.force, opts.is_tty);
     } else {
-        setup_codex_hooks(uninstall, opts.dry_run, opts.yes, opts.is_tty);
+        setup_codex_hooks(uninstall, opts.explicit, opts.dry_run, opts.yes, opts.is_tty);
     }
 }
 
-fn setup_codex_hooks(uninstall: bool, dry_run: bool, yes: bool, is_tty: bool) {
+fn setup_codex_hooks(uninstall: bool, explicit: bool, dry_run: bool, yes: bool, is_tty: bool) {
     // `setup_codex` already refused when no home resolves, so this is Some.
     let Some(path) = codex_hooks_path() else { return };
     let codex_on_path = which("codex");
     if !uninstall && !codex_installed(codex_on_path) {
-        println!("codex: skipped (binary/config not found)");
-        return;
+        return report_skip("codex", "binary/config not found", explicit);
     }
     let existing = match read_for_edit(&path) {
         Ok(t) => t,
@@ -91,6 +90,7 @@ fn setup_codex_hooks(uninstall: bool, dry_run: bool, yes: bool, is_tty: bool) {
         zj_radar_on_path: which("zj-radar"),
         config_text: codex_config_path().and_then(|p| std::fs::read_to_string(p).ok()),
         hooks_text: Some(existing.clone()),
+        daemon_running: false,
     };
     let facts = analyze_codex(&env);
     let Some(outcome) = edit_or_report("codex", edit_codex_hooks(&existing, !uninstall)) else {
@@ -114,7 +114,7 @@ fn setup_codex_hooks(uninstall: bool, dry_run: bool, yes: bool, is_tty: bool) {
                 return;
             }
             let prompt = format!("Write {}?", path.display());
-            if !confirm_and_write("codex", &path, &new, yes, is_tty, &prompt, || Ok(())) {
+            if !confirm_and_write("codex", &path, &new, Consent { yes, is_tty, explicit }, &prompt, || Ok(())) {
                 return;
             }
             println!("codex: hooks {} ({})", if uninstall { "removed" } else { "installed" }, path.display());
@@ -125,12 +125,11 @@ fn setup_codex_hooks(uninstall: bool, dry_run: bool, yes: bool, is_tty: bool) {
     }
 }
 
-fn setup_codex_notify(uninstall: bool, dry_run: bool, yes: bool, force: bool, is_tty: bool) {
+fn setup_codex_notify(uninstall: bool, explicit: bool, dry_run: bool, yes: bool, force: bool, is_tty: bool) {
     // `setup_codex` already refused when no home resolves, so this is Some.
     let Some(path) = codex_config_path() else { return };
     if !uninstall && !codex_installed(which("codex")) {
-        println!("codex: skipped (binary/config not found)");
-        return;
+        return report_skip("codex", "binary/config not found", explicit);
     }
     let existing = match read_for_edit(&path) {
         Ok(t) => t,
@@ -169,8 +168,7 @@ fn setup_codex_notify(uninstall: bool, dry_run: bool, yes: bool, force: bool, is
             }
             let prompt = format!("Write {}?", path.display());
             if !confirm(&prompt, yes, is_tty) {
-                println!("codex: skipped (declined)");
-                return;
+                return report_declined("codex", is_tty, explicit);
             }
             // Replacing our slot while the `.bak` holds the user's notifier:
             // skip the backup rather than copy our line over their only copy.

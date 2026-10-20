@@ -9,13 +9,13 @@
 use crate::agents::Agent;
 use crate::setup::{CLAUDE_PLUGIN, CODEX_HOOK_MARKER};
 
-/// Four producers, four wiring routes — name all, because `zj-radar setup`
+/// Five producers, five wiring routes — name all, because `zj-radar setup`
 /// wires each agent symmetrically (claude drives Claude Code's plugin
-/// marketplace; opencode and pi each drop a vendored JS bridge into their
-/// auto-loaded dirs).
+/// marketplace; opencode, pi and omp each drop a vendored JS bridge into
+/// their auto-loaded dirs).
 pub(crate) const PRODUCER_HINT: &str = "Agent status off — no producer wired. Run `zj-radar setup claude` \
-    (Claude Code), `zj-radar setup codex` (Codex), `zj-radar setup opencode` (Opencode), or \
-    `zj-radar setup pi` (pi).";
+    (Claude Code), `zj-radar setup codex` (Codex), `zj-radar setup opencode` (Opencode), \
+    `zj-radar setup pi` (pi), or `zj-radar setup omp` (omp).";
 
 /// The per-agent evidence, already read. `None` = the file is absent.
 #[derive(Default)]
@@ -35,6 +35,8 @@ pub(crate) struct ProducerTexts {
     pub opencode_tui_plugin: Option<String>,
     /// pi's vendored bridge extension; wired when it carries our header marker.
     pub pi_extension: Option<String>,
+    /// omp's vendored bridge extension; wired when it carries our header marker.
+    pub omp_extension: Option<String>,
 }
 
 impl ProducerTexts {
@@ -47,6 +49,7 @@ impl ProducerTexts {
             opencode_plugin: crate::setup::opencode_plugin_text(),
             opencode_tui_plugin: crate::setup::opencode_tui_plugin_text(),
             pi_extension: crate::setup::pi_extension_text(),
+            omp_extension: crate::setup::omp_extension_text(),
         }
     }
 
@@ -66,6 +69,7 @@ impl ProducerTexts {
                 .into_iter()
                 .any(|text| text.as_deref().is_some_and(crate::setup::detect::opencode_plugin_is_ours)),
             Agent::Pi => self.pi_extension.as_deref().is_some_and(crate::setup::detect::pi_extension_is_ours),
+            Agent::Omp => self.omp_extension.as_deref().is_some_and(crate::setup::detect::omp_extension_is_ours),
         }
     }
 
@@ -115,9 +119,9 @@ pub(crate) fn names(agents: &[Agent]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::setup::{OPENCODE_PLUGIN_MARKER, OPENCODE_TUI_PLUGIN_MARKER, PI_EXTENSION_MARKER};
+    use crate::setup::{OMP_EXTENSION_MARKER, OPENCODE_PLUGIN_MARKER, OPENCODE_TUI_PLUGIN_MARKER, PI_EXTENSION_MARKER};
 
-    fn texts(codex: bool, claude: bool, opencode: bool, pi: bool) -> ProducerTexts {
+    fn texts(codex: bool, claude: bool, opencode: bool, pi: bool, omp: bool) -> ProducerTexts {
         ProducerTexts {
             codex_hooks: codex.then(|| format!("{{\"command\": \"{CODEX_HOOK_MARKER} zj-radar notify codex\"}}")),
             codex_config: None,
@@ -125,6 +129,7 @@ mod tests {
             opencode_plugin: opencode.then(|| format!("// {OPENCODE_PLUGIN_MARKER}\n")),
             opencode_tui_plugin: None,
             pi_extension: pi.then(|| format!("// {PI_EXTENSION_MARKER}\n")),
+            omp_extension: omp.then(|| format!("// {OMP_EXTENSION_MARKER}\n")),
         }
     }
 
@@ -163,7 +168,7 @@ mod tests {
     fn rewire_keeps_each_codex_route_as_installed() {
         // Notify-only Codex re-wires with --legacy-notify, in its own run.
         let notify_only =
-            ProducerTexts { codex_config: Some(OUR_NOTIFY.to_string()), ..texts(false, true, false, false) };
+            ProducerTexts { codex_config: Some(OUR_NOTIFY.to_string()), ..texts(false, true, false, false, false) };
         assert_eq!(
             notify_only.rewire_invocations(),
             vec![vec!["setup", "claude", "-y"], vec!["setup", "codex", "--legacy-notify", "-y"]]
@@ -171,16 +176,17 @@ mod tests {
         let alone = ProducerTexts { codex_config: Some(OUR_NOTIFY.to_string()), ..ProducerTexts::default() };
         assert_eq!(alone.rewire_invocations(), vec![vec!["setup", "codex", "--legacy-notify", "-y"]]);
         // Hooks present (with or without the notify slot): the default route.
-        let both = ProducerTexts { codex_config: Some(OUR_NOTIFY.to_string()), ..texts(true, false, false, true) };
-        assert_eq!(both.rewire_invocations(), vec![vec!["setup", "codex", "pi", "-y"]]);
+        let both =
+            ProducerTexts { codex_config: Some(OUR_NOTIFY.to_string()), ..texts(true, false, false, true, true) };
+        assert_eq!(both.rewire_invocations(), vec![vec!["setup", "codex", "pi", "omp", "-y"]]);
         assert!(ProducerTexts::default().rewire_invocations().is_empty());
     }
 
     #[test]
     fn wired_lists_agents_in_declaration_order() {
-        assert_eq!(texts(true, true, true, true).wired(), Agent::ALL.to_vec());
-        assert_eq!(texts(true, false, true, false).wired(), vec![Agent::Codex, Agent::Opencode]);
-        assert!(texts(false, false, false, false).wired().is_empty());
+        assert_eq!(texts(true, true, true, true, true).wired(), Agent::ALL.to_vec());
+        assert_eq!(texts(true, false, true, false, false).wired(), vec![Agent::Codex, Agent::Opencode]);
+        assert!(texts(false, false, false, false, false).wired().is_empty());
     }
 
     #[test]
@@ -192,6 +198,8 @@ mod tests {
             opencode_plugin: Some("// some other plugin\n".to_string()),
             opencode_tui_plugin: Some("export default { id: \"other\", setup() {} };\n".to_string()),
             pi_extension: Some("// some other extension\n".to_string()),
+            // pi's bridge under omp's name is still not ours.
+            omp_extension: Some(format!("// {PI_EXTENSION_MARKER}\n")),
         };
         assert!(foreign.wired().is_empty(), "present-but-foreign files are not wired");
         assert!(ProducerTexts::default().wired().is_empty(), "absent files are not wired");

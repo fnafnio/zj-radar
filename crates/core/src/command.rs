@@ -87,7 +87,7 @@ const IGNORE_NAMES: &[&str] = &[
 /// deliberately absent: they fall through to ordinary command-tracking, which
 /// still surfaces a Running/Done lifecycle under their own `Kind`.
 /// Matched on the peeled program — including a node/bun-hosted agent script.
-pub const AGENT_NAMES: &[&str] = &["claude", "codex", "opencode", "pi"];
+pub const AGENT_NAMES: &[&str] = &["claude", "codex", "opencode", "pi", "omp"];
 
 /// The CLI's own binary. A hook's `zj-radar notify ...` child can briefly ride
 /// a pane's foreground while pushing a status; it must never surface as a fake

@@ -215,7 +215,9 @@ export default function (pi) {
   });
 
   on("session_start", (event, ctx) => {
-    armed = ctx.mode === "tui" && Boolean(process.env.ZELLIJ);
+    // omp (a pi fork) may share this dir via a `$PI_CODING_AGENT_DIR` both
+    // read; its own bridge reports it — never report an omp process as pi.
+    armed = ctx.mode === "tui" && Boolean(process.env.ZELLIJ) && process.title !== "omp";
     cwd = typeof ctx.cwd === "string" && ctx.cwd ? ctx.cwd : process.cwd();
     // A different session (new/resume/fork) must not inherit the previous
     // one's settled state: an idle dialog closed before its first turn would

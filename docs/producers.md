@@ -1,13 +1,19 @@
 # Producers: sending agent status to the sidebar
 
 The sidebar only displays. A **producer** is whatever broadcasts agent status
-to it. zj-radar ships producers for Claude Code, Codex, Opencode, and pi, a
-`notify generic` command for any script, and documents the wire format so you
-can write your own.
+to it. zj-radar ships producers for Claude Code, Codex, Opencode, pi, and omp
+(oh-my-pi), a `notify generic` command for any script, and documents the wire
+format so you can write your own.
 
 Install the [sidebar](install.md) first. Every producer below needs the
 `zj-radar` CLI on `PATH` except the Claude plugin, which falls back to a
 bundled `bash`+`jq` script when the binary is absent.
+
+`zj-radar setup <agent>` wires the agents you name; a named agent that is not
+found, or a write with no terminal to confirm it (pass `-y`), exits non-zero
+with the reason. Bare `zj-radar setup` wires every agent it finds, skips the
+rest, and points you at `zj-radar setup zellij --download` if the sidebar is
+not installed yet.
 
 ## Claude Code
 
@@ -75,6 +81,13 @@ hooks, run `/hooks` inside Codex once to review and trust them.
 Each entry carries `timeout: 10` (the send deadline plus headroom, see
 [Bound your sends](#bound-your-sends)) and the `ZJ_RADAR_CODEX_HOOK=v1` marker
 that idempotency and `--uninstall` key on.
+
+Codex 0.157+ runs sessions on a shared app-server daemon by default, and the
+daemon runs every session's hooks with the pane environment of whichever pane
+started it. `notify codex` ignores hooks whose parent is `codex app-server`,
+so launch Codex with `--no-daemon` (or set `[features] daemon_auto_start =
+false`) for its rows to appear; see
+[troubleshooting](troubleshooting.md#a-codex-pane-shows-no-status).
 
 `zj-radar setup codex --legacy-notify` uses Codex's older single-slot `notify`
 program instead of hooks. It only reports `done`, and it refuses to replace a
@@ -175,6 +188,40 @@ project-local `.pi/extensions/zj-radar.js` copy would double-report — keep the
 bridge global. `npx pi` / `pnpm dlx pi` launches are not recognized as pi (the
 launcher is the pane's command).
 
+## omp
+
+```sh
+zj-radar setup omp
+zj-radar setup omp --check
+```
+
+omp ([oh-my-pi](https://github.com/can1357/oh-my-pi)) is a fork of pi with its
+own extension runtime. This vendors a bridge extension to
+`~/.omp/agent/extensions/zj-radar-omp.js`, following omp's own agent-dir
+rules: a named profile (`$OMP_PROFILE`, else `$PI_PROFILE`) uses
+`~/.omp/profiles/<name>/agent/`, `$PI_CONFIG_DIR` replaces `.omp`, and
+`$PI_CODING_AGENT_DIR` overrides the default profile's dir. Run `setup omp`
+with the same environment you launch omp with. omp auto-loads the file;
+restart omp.
+
+| omp event | rail |
+|---|---|
+| `agent_start` (after `input`) | running, task label from the prompt (slash commands are not tasks) |
+| `input` while a run is streaming (steer) | running, task label |
+| `tool_execution_start` | running, tool activity |
+| `ask` tool start / end | pending (its first question) / back to running |
+| `tool_approval_requested` / `_resolved` | pending (`Allow <tool>?`) / back to running |
+| `agent_end` | done (trailing question → pending), error when the last assistant message errored, done with no message on Esc; ignored while omp will continue (auto-retry, a background job) |
+| `session_switch{new}` / `session_shutdown` | idle |
+
+omp binds every extension into each subagent session too; the bridge reports
+only the main session, except that a subagent's `ask` or tool approval shown
+in your TUI still surfaces as "needs you" (it blocks you all the same). Like pi's, the bridge
+reports only in the interactive TUI under Zellij, and `omp --no-extensions`
+disables it. omp honors `$PI_CODING_AGENT_DIR`, so pi and omp can share one
+extensions dir: the two bridges have different file names, and each stays
+silent inside the other agent's process.
+
 ## Any script: `zj-radar notify generic`
 
 Deploy scripts, cron jobs, and homegrown loops can put a row on the radar
@@ -192,7 +239,7 @@ zj-radar notify generic --status done --msg "deploy finished" --source deploy
 - `--task`: the sticky task label. Empty keeps the stored one.
 - `--source`: the kind mark. `test` ⚗ · `build` ⚙ · `deploy` ⇡ · `server` ❯ ·
   `remote` ⇄ · `command` `$`, or an agent token (`claude` ✳ · `codex` ❉ ·
-  `opencode` ✺ · `pi` ✴ · `gemini` ✦). `server` and `remote` rows hold a steady `▸`
+  `opencode` ✺ · `pi` ✴ · `omp` ✷ · `gemini` ✦). `server` and `remote` rows hold a steady `▸`
   instead of spinning; a `remote` completion notifies as a disconnect.
   Anything else, including the default `generic`, renders `⦿`.
 - Repo and branch come from `git` in the calling directory; the pane id from
@@ -310,3 +357,110 @@ Three rules keep you safe:
    timeout, set it at least 2 seconds above your send deadline so the
    graceful path finishes before the runner kills it. The bundled Claude hooks
    keep `timeout >= deadline + 2`; the Codex entries use deadline + 5.
+
+## Presence file and `state --json`
+
+Each session's rails publish what they know to a file; `zj-radar state` and
+peer rails read it. This is the one consumer-facing contract besides the pipes.
+
+**Location.** `<zellij cache root>/<plugin URL as nested path>/plugin_cache/zj-radar.presence.<zellij_pid>.json`
+(macOS root `~/Library/Caches/org.Zellij-Contributors.Zellij`, Linux
+`$XDG_CACHE_HOME/zellij`, default `~/.cache/zellij`). Written by temp file and
+atomic rename. When that cache is unwritable the plugin falls back to its
+`/tmp` mount (host `$TMPDIR/zellij-<uid>/zj-radar`); `state` does not scan
+it, so such a session is not listed.
+
+**Schema (`v` = 1).**
+
+| Field | Meaning |
+|---|---|
+| `v` | File format version. Additive fields never bump it; a meaning or cap change does. |
+| `session_name` | Zellij session name. |
+| `running`, `attention` | Counts of agent (status-origin) panes only: working, and needing you. |
+| `attention_tab_position` | Position of the tab to land on for attention; `null` = none. |
+| `updated_epoch_s` | When the content was last written. |
+| `tabs` | `[{position, name, panes}]`, one per tab. |
+| `panes[]` | `{pane_id, origin, kind, status, label}`: tracked panes only. `origin` is `"status"` (agent) or `"command"` (observed command); plain shells and editors are excluded. `pane_id` and `origin` are absent in pre-v1 files. |
+
+Status-origin panes sort before commands, then the 16-pane cap applies. An
+agent's `label` is its sticky task (falling back to the agent kind); a
+command's is its command line.
+
+**Caps and hostile text.** 64 tabs, 16 panes per tab, 96-character labels.
+Readers truncate only the structural caps (tabs, and panes per tab). Text is
+never truncated on read: a file with an over-long or control/otherwise
+unsanitary string anywhere is rejected whole.
+
+**Liveness.** Each session rewrites its file about every 60 s. A file older
+than 90 s is stale; older than 300 s it is dead and peers reap it. Content
+changes are written by one rail per session: the most recently active one,
+which holds the `zj-radar.<pid>.presence-writer` token beside the file (it has
+the freshest view of the session's tabs). After a detach that rail keeps
+publishing. Other rails write only to rescue a file older than 75 s, so a
+session that lost its writer may briefly read as stale but is never reaped.
+
+**`zj-radar state [--json] [--needs-attention] [--include-stale] [--session NAME]`.**
+`--json` prints one line:
+
+```json
+{"v":1,"sessions":[{"name":"work","current":true,"stale":false,"age_s":12,
+  "running":1,"attention":1,"attention_tab_position":2,
+  "tabs":[{"position":2,"name":"api","panes":[{"pane_id":14,"origin":"status",
+  "kind":"claude","status":"pending","label":"fix login"}]}]}]}
+```
+
+| Field | Meaning |
+|---|---|
+| `v` | Output format version, independent of the file's `v`. |
+| `sessions[]` | One per live session (dead files and duplicates dropped), the current session first, then by name. |
+| `name` | Zellij session name. |
+| `current` | `true` when `name` equals `$ZELLIJ_SESSION_NAME`. |
+| `stale` | No write for over 90 s (`age_s` > 90). |
+| `age_s` | Seconds since the file was last written, by its mtime. |
+| `running`, `attention` | The file's counts (agent panes working, and needing you); never filtered. |
+| `attention_tab_position` | The file's tab to land on for attention, or `null`. |
+| `tabs` | The file's `tabs` as written (`[{position, name, panes}]`, panes as in the file schema above). Under `--needs-attention`, only matching panes and the tabs holding them. |
+
+`position` and `attention_tab_position` are 0-based; `zellij action
+go-to-tab` is 1-based, so jump with `go-to-tab $((pos + 1))`. A pane's
+`status` is one of `running`, `pending`, `done`, `error`, `idle` (see
+[the activity model](activity-model.md)); `kind` is an agent (`claude`,
+`codex`, `opencode`, `pi`, `omp`, `gemini`) or a command class (`test`, `build`,
+`deploy`, `server`, `remote`, `command`, `other`), the `Kind` axis in
+[the activity model](activity-model.md#2-the-three-orthogonal-axes).
+
+`--needs-attention` keeps agent panes that are pending or error and skips
+stale sessions unless `--include-stale` (which requires `--needs-attention`);
+session-level `running` and `attention` stay unfiltered. Pre-v1 files (`v` absent or 0) have
+no pane `origin`, so the match degrades there: their origin-less panes count
+as agents (a command pane in error matches too), and a pre-v1 session with
+`attention` > 0 matches even without a matching pane, listed with `tabs: []`.
+
+| Exit | Meaning |
+|---|---|
+| 0 | OK, or a `--needs-attention` match. |
+| 1 | `--needs-attention` matched nothing. |
+| 2 | Error, including a stdout write failure and clap usage errors. |
+
+Jump to the first pane needing you, in the current session:
+
+```sh
+zj-radar state --json --needs-attention \
+  | jq -r '.sessions[] | select(.current) | .tabs[0] | "\(.position + 1) \(.panes[0].pane_id)"' \
+  | { read -r tab pane && zellij action go-to-tab "$tab" && zellij action focus-pane-id "terminal_$pane"; }
+```
+
+A missing cache is an empty answer. `ZJ_RADAR_CACHE_DIR` (a Zellij cache root)
+replaces the platform root; it is for tests and sandboxes.
+There is no `--refresh`: `state` never queries Zellij, so `age_s` is the
+freshness signal.
+
+**Known limits.**
+
+- Same-name sessions from separate Zellij servers collapse to one (newest
+  `updated_epoch_s` wins).
+- `state` sees every zj-radar plugin URL; a rail sees only peers under its own.
+- `current` comes from `$ZELLIJ_SESSION_NAME`, which goes stale after
+  `rename-session`.
+- Tab names and task labels are written to the cache directory
+  unconditionally.

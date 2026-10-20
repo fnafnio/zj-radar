@@ -463,3 +463,53 @@ fn a_notify_invocation_clap_rejects_still_exits_zero_and_sends_nothing() {
     // Every other subcommand keeps clap's contract: usage on stderr, exit 2.
     Command::cargo_bin("zj-radar").unwrap().args(["setup", "--no-such-flag"]).assert().code(2);
 }
+
+/// Run `notify codex` the way Codex runs a hook: as a CHILD of a process
+/// named `codex` (a `#!/bin/sh` stand-in, so its argv reads `/bin/sh
+/// …/codex <codex_args>`), stdin = the hook payload.
+fn notify_codex_under(shims: &ShimDir, codex_args: &str) {
+    let bin = assert_cmd::cargo::cargo_bin("zj-radar");
+    let hook = shims.dir.path().join("hook.json");
+    std::fs::write(&hook, r#"{"hook_event_name":"UserPromptSubmit","cwd":"/home/u/myrepo","prompt":"hi"}"#).unwrap();
+    let fake_codex = shims.dir.path().join("fakecodex").join("codex");
+    std::fs::create_dir_all(fake_codex.parent().unwrap()).unwrap();
+    // `rc=$?; exit` keeps the shell alive as the parent (no tail-exec).
+    std::fs::write(
+        &fake_codex,
+        format!("#!/bin/sh\n'{}' notify codex < '{}'\nrc=$?\nexit $rc\n", bin.display(), hook.display()),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&fake_codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let status = std::process::Command::new(&fake_codex)
+        .args(codex_args.split_whitespace())
+        .env("PATH", shims.path_env())
+        .env("ZELLIJ", "1")
+        .env("ZELLIJ_PANE_ID", "terminal_7")
+        .env("TMPDIR", shims.dir.path())
+        .env_remove("XDG_RUNTIME_DIR")
+        .env_remove("ZELLIJ_SESSION_NAME")
+        .status()
+        .unwrap();
+    assert!(status.success(), "notify must exit 0 either way");
+}
+
+#[test]
+fn codex_hook_from_the_shared_app_server_daemon_is_dropped() {
+    // Issue #71: the daemon's ZELLIJ_PANE_ID is whichever pane started it.
+    let shims = ShimDir::new();
+    shims.add_recorder("zellij");
+    shims.add_fake_git("/home/u/myrepo", "main");
+    notify_codex_under(&shims, "app-server --listen unix:// --managed-daemon");
+    assert!(shims.recorded("zellij").is_empty(), "a daemon hook names no real pane — must not broadcast");
+}
+
+#[test]
+fn codex_hook_from_the_tui_still_broadcasts() {
+    let shims = ShimDir::new();
+    shims.add_recorder("zellij");
+    shims.add_fake_git("/home/u/myrepo", "main");
+    notify_codex_under(&shims, "--yolo");
+    let argv = shims.sole_pipe_argv();
+    assert!(argv.contains("\"id\":7") && argv.contains("\"status\":\"running\""), "payload: {argv}");
+}

@@ -14,8 +14,8 @@ use crate::status::GlyphSet;
 /// rather than silently falling back.
 macro_rules! kinds {
     ( $( $variant:ident => $source:literal, $plain:literal, $nerd:literal );+ $(;)? ) => {
-        /// What kind of process owns a pane. Agents (Claude, Codex, Opencode, Pi,
-        /// Gemini) and task types (Test, Build, Deploy, Server) are peers — only
+        /// What kind of process owns a pane. Agents (Claude, Codex, Opencode, Pi, Omp,
+        /// Gemini) and task types (Test, Build, Deploy, Server, Remote) are peers — only
         /// the mark glyph differs; the renderer and sorter treat all variants
         /// identically.
         ///
@@ -72,6 +72,7 @@ kinds! {
     Codex    => "codex",    '❉', '\u{f167a}'; // nf-md-robot-outline
     Opencode => "opencode", '✺', '\u{f0169}'; // nf-md-code-braces
     Pi       => "pi",       '✴', '\u{f03ff}'; // nf-md-pi
+    Omp      => "omp",      '✷', '\u{f0400}'; // nf-md-pi-box
     Gemini   => "gemini",   '✦', '\u{f0eb9}'; // nf-md-star-four-points (sparkle)
     Command  => "command",  '$', '$';
     Other    => "other",    '⦿', '⦿';
@@ -91,7 +92,7 @@ impl Kind {
     /// must declare which side it is here before it compiles.
     pub fn is_agent(self) -> bool {
         match self {
-            Kind::Claude | Kind::Codex | Kind::Opencode | Kind::Pi | Kind::Gemini => true,
+            Kind::Claude | Kind::Codex | Kind::Opencode | Kind::Pi | Kind::Omp | Kind::Gemini => true,
             Kind::Command | Kind::Other | Kind::Test | Kind::Build | Kind::Deploy | Kind::Server | Kind::Remote => {
                 false
             }
@@ -111,6 +112,7 @@ impl Kind {
             | Kind::Codex
             | Kind::Opencode
             | Kind::Pi
+            | Kind::Omp
             | Kind::Gemini
             | Kind::Command
             | Kind::Other
@@ -132,6 +134,7 @@ impl Kind {
             | Kind::Codex
             | Kind::Opencode
             | Kind::Pi
+            | Kind::Omp
             | Kind::Gemini
             | Kind::Command
             | Kind::Other
@@ -242,6 +245,17 @@ mod tests {
     }
 
     #[test]
+    fn omp_is_an_agent_kind_with_neutral_width_marks() {
+        assert_eq!(Kind::from_source("omp"), Kind::Omp);
+        assert!(Kind::Omp.is_agent());
+        assert!(!Kind::Omp.is_service());
+        assert!(!Kind::Omp.is_remote());
+        // U+2737 is East-Asian-Width Neutral, like the other agent asterisks.
+        assert_eq!(Kind::Omp.mark(GlyphSet::Plain), '✷');
+        assert_eq!(Kind::Omp.mark(GlyphSet::Nerd), '\u{f0400}'); // nf-md-pi-box
+    }
+
+    #[test]
     fn is_remote_only_for_remote() {
         for &k in Kind::ALL {
             assert_eq!(k.is_remote(), k == Kind::Remote, "{k:?}");
@@ -276,7 +290,7 @@ mod tests {
     fn all_enumerates_every_variant() {
         // `ALL` drives the exhaustiveness of the other tests; pin its size so a
         // dropped table row is caught here instead of silently shrinking coverage.
-        assert_eq!(Kind::ALL.len(), 12);
+        assert_eq!(Kind::ALL.len(), 13);
         assert_eq!(Kind::Other.as_source(), "other");
     }
 

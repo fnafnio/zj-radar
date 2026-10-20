@@ -8,8 +8,8 @@
 
 use super::detect::opencode_plugin_is_ours;
 use super::vendored::{
-    dry_run_backup_line, kept_backup_line, plan_install, plan_uninstall, read_existing, remove_backup_if_ours,
-    write_bridge, Existing, InstallPlan, UninstallPlan,
+    dry_run_backup_line, kept_backup_line, plan_install, plan_uninstall, read_existing, refuse_if_managed,
+    remove_backup_if_ours, write_bridge, Existing, InstallPlan, UninstallPlan,
 };
 use super::*;
 
@@ -124,8 +124,7 @@ pub(crate) fn setup_opencode(uninstall: bool, opts: BridgeSetupOpts) {
     let Some(bridges) = bridges() else { return };
     let opencode_on_path = which("opencode");
     if !uninstall && !opencode_installed(opencode_on_path) {
-        println!("opencode: skipped (binary/config not found)");
-        return;
+        return report_skip("opencode", "binary/config not found", opts.explicit);
     }
     let env = OpencodeEnv {
         opencode_on_path,
@@ -162,6 +161,12 @@ pub(crate) fn setup_opencode(uninstall: bool, opts: BridgeSetupOpts) {
         print_opencode_guidance(&facts, false);
         return;
     }
+    // Refuse as a unit here too: half a managed pair rewritten is no better
+    // than half a foreign one.
+    let managed: Vec<bool> = to_write.iter().map(|b| refuse_if_managed("opencode", &b.path, false)).collect();
+    if managed.contains(&true) {
+        return;
+    }
     if opts.dry_run {
         for b in &to_write {
             println!("--- {} (dry-run) ---\n{}", b.path.display(), b.embedded);
@@ -174,8 +179,7 @@ pub(crate) fn setup_opencode(uninstall: bool, opts: BridgeSetupOpts) {
     // unasked.
     let prompt = format!("Write {}?", paths_list(to_write.iter().map(|b| b.path.clone())));
     if !confirm(&prompt, opts.yes, opts.is_tty) {
-        println!("opencode: skipped (declined)");
-        return;
+        return report_declined("opencode", opts.is_tty, opts.explicit);
     }
     for b in &to_write {
         if let Err(e) = write_bridge(&b.path, b.embedded, &b.existing, opencode_plugin_is_ours) {
@@ -195,6 +199,7 @@ fn uninstall_opencode(bridges: &[Bridge], opts: &BridgeSetupOpts) {
             UninstallPlan::NotOurs => {
                 println!("opencode: plugin not ours (marker absent) — leaving {}", b.path.display());
             }
+            UninstallPlan::Remove if refuse_if_managed("opencode", &b.path, true) => {}
             UninstallPlan::Remove => to_remove.push(b),
         }
     }
@@ -216,8 +221,7 @@ fn uninstall_opencode(bridges: &[Bridge], opts: &BridgeSetupOpts) {
     // Same consent step as every other setup write/remove: a non-tty run
     // without -y skips rather than deleting unasked.
     if !confirm(&format!("Remove {listed}?"), opts.yes, opts.is_tty) {
-        println!("opencode: skipped (declined)");
-        return;
+        return report_declined("opencode", opts.is_tty, opts.explicit);
     }
     for b in &to_remove {
         if let Err(e) = std::fs::remove_file(&b.path) {

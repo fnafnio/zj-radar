@@ -168,6 +168,11 @@ If you write the layout by hand, copy those blocks; if your layout already has
 its own swaps, see
 [Alt+] hides the rail](troubleshooting.md#alt-hides-the-rail-or-stops-cycling).
 
+With [`show_mode true`](configuration.md#options) the rail's footer
+shows the current Zellij mode, so you can delete every `zellij:status-bar` pane
+(one per template, including `tab_template name="ui"` if your layout has it)
+and get those rows back. You lose the status bar's keybinding hints.
+
 For a complete starting layout, copy
 [`examples/radar-sidebar.kdl`](../examples/radar-sidebar.kdl) to
 `~/.config/zellij/layouts/` and run `zellij --layout radar-sidebar`.
@@ -226,8 +231,8 @@ Items are `ok`, `warn`, or `missing`:
 - **wasm**: file present at the stable path.
 - **layout**: the default layout contains the rail.
 - **grant**: `permissions.kdl` grants the wasm path.
-- **producer**: which of the Claude plugin, Codex hooks, Opencode bridge, and
-  pi extension are wired. The Claude plugin is found under
+- **producer**: which of the Claude plugin, Codex hooks, Opencode bridge, pi
+  extension, and omp extension are wired. The Claude plugin is found under
   `$CLAUDE_CONFIG_DIR` (default `~/.claude`).
 - **managed config** (only when `config.kdl` is a symlink, as under
   home-manager): direct edits may be overwritten.
@@ -238,7 +243,7 @@ Items are `ok`, `warn`, or `missing`:
 `zj-radar setup --check` checks the sidebar plus every agent it detects, so an
 agent you don't use never fails it. An agent binary missing from `PATH` while
 zj-radar is wired for it (the Claude plugin installed; our Codex hooks or
-notify slot; our opencode or pi bridge) is a `warn`, not a `missing`.
+notify slot; our opencode, pi, or omp bridge) is a `warn`, not a `missing`.
 
 ## Upgrade (`zj-radar update`)
 
@@ -257,8 +262,10 @@ zj-radar update --check    # report only; exit 1 when an update is available
    `~/.config/zellij/plugins/zj_radar.wasm` comes from the same release. The
    file is rewritten only when its bytes differ.
 3. Runs `setup` for the producers already wired (Codex hooks, Opencode
-   bridge, pi extension), never for one you have not set up. The Claude Code
+   bridge, pi and omp extensions), never for one you have not set up. The Claude Code
    plugin updates from inside Claude: `/plugin update zj-radar-claude@zj-radar`.
+   If this rewrote the Codex hooks, run `/hooks` in Codex and trust them
+   again; until then Codex skips them and its rows stay dark.
 4. Runs the doctor (`setup --check`).
 
 Restart Zellij, or open a new session, to load the new sidebar. A running
@@ -338,6 +345,10 @@ zjRadarWasm = pkgs.fetchurl {
 };
 ```
 
+`setup` treats a symlinked `config.kdl`, layout, wasm, or vendored
+opencode/pi/omp bridge file as yours to manage: it warns and leaves the file
+alone rather than replace or remove the link.
+
 ## Files zj-radar creates (and how to remove them)
 
 Paths are the defaults; `ZELLIJ_CONFIG_DIR` / `XDG_CONFIG_HOME` move the
@@ -352,11 +363,12 @@ config-dir entries with them.
 | `~/.config/zellij/plugins/zj_radar.wasm` | `setup zellij --wasm/--download` | left in place; `rm` it |
 | `permissions.kdl` grant entry (macOS `~/Library/Caches/org.Zellij-Contributors.Zellij/`, Linux `~/.cache/zellij/`) | `setup zellij` with your consent, or Zellij when you answer `y` | left in place (Zellij also writes this file); delete the `zj_radar.wasm` block |
 | `run`'s config dir (macOS `~/Library/Application Support/zj-radar/`, Linux `~/.local/share/zj-radar/`) | `zj-radar run` | not touched by `setup`; `rm -r` it, it holds only re-materializable assets and session markers |
-| Per-session plugin state under Zellij's cache, `/tmp/zj-radar` fallback | the running plugin | self-pruning after 24 h; safe to delete anytime |
+| Per-session plugin state under Zellij's cache, fallback `$TMPDIR/zellij-<uid>/zj-radar` (`/tmp/zellij-<uid>/zj-radar` when `$TMPDIR` is unset) | the running plugin | self-pruning after 24 h; safe to delete anytime |
 | `zj-radar-dedup-<uid>/` under `$XDG_RUNTIME_DIR` (else `$TMPDIR`/`/tmp`): send-dedup records and background-subagent markers | `zj-radar notify` | self-expiring; safe to delete anytime (0.7.x left a `zj-radar-dedup/` there too) |
 | `$CODEX_HOME/hooks.json` entries (+ optional `notify` slot in `config.toml`) | `setup codex` | **reversed** by `setup codex --uninstall` |
 | `zj-radar-claude` plugin + `zj-radar` marketplace entry in Claude Code's plugin store | `setup claude` | plugin **reversed** by `setup claude --uninstall`; marketplace entry stays: `claude plugin marketplace remove zj-radar` |
 | `plugins/zj-radar.js` (1.x) and `plugins/zj-radar/tui.js` (2.x) under `$XDG_CONFIG_HOME/opencode/` (or `~/.config/opencode/`) | `setup opencode` | **reversed** by `setup opencode --uninstall` (each only when the marker is present), along with its `.zj-radar.bak` when that backup is ours (a backup of the foreign file `--force` replaced is left for you, with the `mv` that restores it; `--dry-run` names which) and the emptied `zj-radar/` dir |
+| `~/.omp/agent/extensions/zj-radar-omp.js` (or the active omp profile's / `$PI_CODING_AGENT_DIR`'s `extensions/`) | `setup omp` | **reversed** by `setup omp --uninstall` (only when the marker is present), with the same backup handling as `setup pi` |
 | `~/.pi/agent/extensions/zj-radar.js` (or `$PI_CODING_AGENT_DIR/extensions/zj-radar.js`) | `setup pi` | **reversed** by `setup pi --uninstall` (only when the marker is present), along with its `.zj-radar.bak` when that backup is ours (a backup of the foreign file `--force` replaced is left for you, with the `mv` that restores it; `--dry-run` names which) |
 
 Complete removal:
@@ -367,6 +379,7 @@ zj-radar setup claude --uninstall -y && claude plugin marketplace remove zj-rada
 zj-radar setup codex --uninstall -y
 zj-radar setup opencode --uninstall -y
 zj-radar setup pi --uninstall -y
+zj-radar setup omp --uninstall -y
 ```
 
 then delete the wasm, the `run` data dir, the grant block, and the binary.

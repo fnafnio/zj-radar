@@ -38,6 +38,7 @@ mod control;
 #[cfg(test)]
 mod hooks_manifest_tests;
 mod ledger;
+mod mode;
 mod notify_rules;
 mod permission;
 mod presence;
@@ -83,6 +84,29 @@ const PIPE_NAME: &str = payload::STATUS_PIPE_NAME;
 const CONFIG_PIPE: &str = config::CONFIG_PIPE;
 #[cfg(target_arch = "wasm32")]
 const CMD_PIPE: &str = control::CMD_PIPE;
+
+/// Zellij's `InputMode` → the host-testable `mode::Mode` mirror. Exhaustive
+/// on purpose: a mode added upstream fails this build instead of rendering
+/// as something else.
+#[cfg(target_arch = "wasm32")]
+fn input_mode(mode: InputMode) -> mode::Mode {
+    match mode {
+        InputMode::Normal => mode::Mode::Normal,
+        InputMode::Locked => mode::Mode::Locked,
+        InputMode::Resize => mode::Mode::Resize,
+        InputMode::Pane => mode::Mode::Pane,
+        InputMode::Tab => mode::Mode::Tab,
+        InputMode::Scroll => mode::Mode::Scroll,
+        InputMode::EnterSearch => mode::Mode::EnterSearch,
+        InputMode::Search => mode::Mode::Search,
+        InputMode::RenameTab => mode::Mode::RenameTab,
+        InputMode::RenamePane => mode::Mode::RenamePane,
+        InputMode::Session => mode::Mode::Session,
+        InputMode::Move => mode::Mode::Move,
+        InputMode::Prompt => mode::Mode::Prompt,
+        InputMode::Tmux => mode::Mode::Tmux,
+    }
+}
 
 #[derive(Default)]
 pub struct State {
@@ -181,6 +205,11 @@ impl State {
     /// comment) rather than folding it in here.
     fn handle_effects(&mut self, effects: Vec<Effect>) -> bool {
         let mut render = false;
+        // Set when a token takeover's re-entrant republish just wrote this
+        // instance's presence: a later `PersistPresence` in the same batch
+        // would serialize and write the identical tree again (the JSON is
+        // derived lazily from the same runtime state), so it is skipped.
+        let mut presence_republished = false;
         for effect in effects {
             match effect {
                 // Keep in lockstep with REQUIRED_PLUGIN_PERMISSIONS in
@@ -217,8 +246,22 @@ impl State {
                         run_command(&args, std::collections::BTreeMap::new());
                     }
                 }
+                Effect::PersistPresence { .. } if presence_republished => {}
                 Effect::PersistPresence { unless_fresher_than } => {
-                    self.session_files.persist_presence(unless_fresher_than, || self.runtime.presence_json())
+                    self.session_files.persist_presence(unless_fresher_than, runtime::PRESENCE_RESCUE_AFTER, || {
+                        self.runtime.presence_json()
+                    })
+                }
+                Effect::ClaimPresenceWriter { preempt } => {
+                    // A takeover means the file holds another instance's
+                    // (possibly frozen) view: republish ours, re-entrantly.
+                    // The runtime emits the claim ahead of `project`'s own
+                    // presence effect, so the flag covers the outer write.
+                    if self.session_files.claim_presence_writer(preempt) {
+                        let outcome = self.runtime.presence_writer_acquired();
+                        render |= self.handle_outcome(outcome);
+                        presence_republished = true;
+                    }
                 }
                 Effect::ReadPresences => {
                     let raw =
@@ -440,7 +483,7 @@ impl ZellijPlugin for State {
                 self.handle_outcome(outcome)
             }
             Event::ModeUpdate(mode_info) => {
-                let outcome = self.runtime.session_name_changed(mode_info.session_name);
+                let outcome = self.runtime.mode_changed(mode_info.session_name, input_mode(mode_info.mode));
                 self.handle_outcome(outcome)
             }
             Event::Visible(visible) => {

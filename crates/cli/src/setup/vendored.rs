@@ -1,6 +1,6 @@
 //! One vendored bridge file's install/uninstall decision — shared by every
 //! producer whose wiring is "drop a marked file into the agent's auto-loaded
-//! dir" (opencode, pi). Pure; the caller supplies the ownership test.
+//! dir" (opencode, pi, omp). Pure; the caller supplies the ownership test.
 
 /// What `setup <agent>` found at a bridge path. Three-state on purpose:
 /// `Absent` must never collapse into `Text("")` — the foreign-file refusal
@@ -85,6 +85,26 @@ pub(crate) fn dry_run_backup_line(label: &str, path: &std::path::Path, is_ours: 
         UninstallPlan::Remove => Some(format!("--- would remove {} (dry-run) ---", bak.display())),
         UninstallPlan::NotOurs => Some(kept_backup_line(label, &bak, path, true)),
     }
+}
+
+/// The Nix / home-manager guard the zellij files get (`path_is_managed`),
+/// applied to a bridge about to be written or removed: a symlinked bridge is
+/// the user's Nix config's to manage. The atomic rename in [`write_bridge`]
+/// would replace the link with a regular file the next switch reverts, and
+/// a remove would delete a link that config owns. Like zellij's guard it
+/// warns and leaves the file — a notice, not a failure. Returns whether
+/// `path` is managed (the caller then skips the write/remove).
+pub(crate) fn refuse_if_managed(label: &str, path: &std::path::Path, uninstall: bool) -> bool {
+    if !super::path_is_managed(path) {
+        return false;
+    }
+    let (verb, how) = if uninstall { ("remove", "remove") } else { ("overwrite", "update") };
+    eprintln!(
+        "{label}: {} is a symlink (managed by Nix / home-manager) — zj-radar will not {verb} a \
+         managed bridge; {how} it via your Nix config instead.",
+        path.display()
+    );
+    true
 }
 
 /// Write the embedded bridge over `path` (holding `existing`) — the vendored

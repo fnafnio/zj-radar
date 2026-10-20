@@ -57,6 +57,13 @@ pub(crate) fn pi_extension_is_ours(text: &str) -> bool {
     text.contains(PI_EXTENSION_MARKER_PREFIX)
 }
 
+/// True iff an omp extension file's text carries our ownership marker (any
+/// version). The single reader behind `setup omp`'s gating, the doctor, and
+/// producer detection.
+pub(crate) fn omp_extension_is_ours(text: &str) -> bool {
+    text.contains(OMP_EXTENSION_MARKER_PREFIX)
+}
+
 /// The layout name a `config.kdl` selects via `default_layout "name"`, or
 /// `None` when unset. Line-scan like the other config detectors: the node at
 /// line start (not commented out), its first argument quoted or bare. This is

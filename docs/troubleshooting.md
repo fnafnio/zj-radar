@@ -61,6 +61,36 @@ nothing about the [producer](producers.md). In order:
    `ZJ_RADAR_NO_DEDUP=1`.
 5. **Zellij too old.** The floor is 0.44.3; `--check` flags it.
 
+## A Codex pane shows no status
+
+**Symptom:** Codex works in a pane, the hooks are installed and trusted, but
+its row never appears (or, with zj-radar 0.10 and older, Codex status shows up
+on the wrong pane).
+
+**Why:** since 0.157 Codex runs sessions on a shared background app-server
+daemon by default, and every session's hooks run inside that daemon with the
+environment it captured at startup: the `$ZELLIJ_PANE_ID` of whichever pane
+happened to start it. Nothing in the hook payload names the real pane, so
+`notify codex` ignores hooks that come from the daemon rather than paint the
+wrong row. Codex keeps hooks client-agnostic by design
+([openai/codex#48500](https://github.com/openai/codex/issues/48500)).
+
+**Fix:** run Codex without the daemon, either per launch or for good:
+
+```sh
+alias codex='codex --no-daemon'
+```
+
+```toml
+# $CODEX_HOME/config.toml (default ~/.codex)
+[features]
+daemon_auto_start = false
+```
+
+Then stop the running daemon with `codex app-server daemon stop`, since a TUI
+attaches to a live daemon whatever `daemon_auto_start` says.
+`zj-radar setup codex --check` reports the daemon's state.
+
 ## A pi pane shows no status
 
 **Symptom:** pi works in a pane, but its row never appears.
@@ -75,6 +105,19 @@ command.
 **Fix:** run `zj-radar setup pi --check`, then restart pi or run `/reload`.
 Launch the installed `pi` binary rather than a package runner. Details in
 [producers](producers.md#pi).
+
+## An omp pane shows no status
+
+**Symptom:** omp works in a pane, but its row never appears.
+
+**Why:** same rules as pi: the bridge reports only from omp's interactive TUI
+under Zellij, and omp loads extensions at startup. omp also reads its
+extensions from the *active profile's* agent dir, so a bridge installed while
+`$OMP_PROFILE` (or `$PI_CONFIG_DIR` / `$PI_CODING_AGENT_DIR`) differed from
+your launch environment sits where omp never looks.
+
+**Fix:** run `zj-radar setup omp --check` in the environment you launch omp
+from, then restart omp. Details in [producers](producers.md#omp).
 
 ## No background-task lines under a Claude pane
 
@@ -225,7 +268,8 @@ the next broadcast.
 
 **Why:** with one instance per tab, one instance owns the first-run prompt and
 the others wait for Zellij's cached answer. Coordination uses Zellij's shared
-plugin cache, falling back to `/tmp/zj-radar`. If neither is writable, more
+plugin cache, falling back to the plugin's `/tmp/zj-radar` (on the host,
+`$TMPDIR/zellij-<uid>/zj-radar`). If neither is writable, more
 than one instance may prompt and late sidebars start empty until the next
 broadcast.
 
@@ -288,6 +332,12 @@ A running session keeps the plugin it loaded. Restart Zellij, or open a new
 session. `zj-radar update --check` confirms the installed wasm matches the
 release. If it reports the wasm as a symlink managed by Nix or home-manager,
 `update` left it alone; update the flake input instead.
+
+## Codex panes go dark after `zj-radar update`
+
+When an update rewrites the Codex hooks, Codex treats them as new and skips
+them until you trust them again. Run `/hooks` inside Codex and trust the
+zj-radar command hook; the rows light up on the next turn.
 
 ## Zellij plugin-reload quirks
 

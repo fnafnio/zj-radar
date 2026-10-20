@@ -17,6 +17,7 @@ A three-crate Cargo workspace plus three non-Rust producers:
 | `crates/cli/src/setup/opencode_plugin.js` | The Opencode 1.x bridge (server plugin), vendored into opencode's plugins dir as `zj-radar.js` by `setup opencode`. |
 | `crates/cli/src/setup/opencode_tui_plugin.js` | The Opencode 2.x bridge (TUI plugin), vendored as `zj-radar/tui.js` by `setup opencode`. |
 | `crates/cli/src/setup/pi_extension.js` | The pi bridge extension, vendored into pi's extensions dir as `zj-radar.js` by `setup pi` (harness: `crates/cli/tests/pi_bridge.test.mjs`, `just test-js`). |
+| `crates/cli/src/setup/omp_extension.js` | The omp (oh-my-pi) bridge extension, vendored into omp's extensions dir as `zj-radar-omp.js` by `setup omp` (harness: `crates/cli/tests/omp_bridge.test.mjs`, `just test-js`). |
 | `docs/` | User docs, the design doc, the executable rail spec. |
 
 Two rules are load-bearing. Read [`CONTEXT.md`](CONTEXT.md) before changing
@@ -55,7 +56,7 @@ cargo build --release --target wasm32-wasip1 -p zj-radar-plugin    # the wasm Ze
 ```sh
 just test        # L1–L4: unit, insta snapshots, proptest, vt100 (deterministic, host-only)
 just test-bash   # bats + shellcheck for notify.sh, install.sh, funnel.sh
-just test-js     # node --test for the pi bridge extension (crates/cli/tests/pi_bridge.test.mjs)
+just test-js     # node --test for the pi and omp bridge extensions (crates/cli/tests/*_bridge.test.mjs)
 just test-e2e    # L5: builds the wasm and drives a real Zellij in a PTY
 just ci          # what every PR must pass: test + clippy + wasm build + test-bash + test-js
 just review      # accept intentional insta snapshot changes

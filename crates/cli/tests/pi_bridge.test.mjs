@@ -338,6 +338,20 @@ test("non-tui mode and no ZELLIJ are silent", async () => {
   assert.deepEqual(events(), []);
 });
 
+test("an omp process sharing the extensions dir is silent", async () => {
+  const saved = process.title;
+  process.title = "omp";
+  try {
+    const rt = await loadRuntime();
+    rt.emit("session_start", { reason: "startup" });
+    rt.emit("agent_start");
+  } finally {
+    process.title = saved;
+  }
+  await settle();
+  assert.deepEqual(events(), []);
+});
+
 test("coalesces tool refreshes but never drops edges", async () => {
   behavior = "slow";
   const rt = await loadRuntime();

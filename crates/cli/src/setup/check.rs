@@ -45,6 +45,9 @@ pub(crate) fn check_codex(legacy_notify: bool) -> bool {
         zj_radar_on_path: which("zj-radar"),
         config_text: codex_config_path().and_then(|p| std::fs::read_to_string(p).ok()),
         hooks_text: codex_hooks_path().and_then(|p| std::fs::read_to_string(p).ok()),
+        daemon_running: codex_config_path()
+            .and_then(|p| p.parent().map(crate::codex_daemon::daemon_running))
+            .unwrap_or(false),
     };
     let items = codex_check_items(&analyze_codex(&env), legacy_notify);
     println!("codex:");
@@ -276,6 +279,38 @@ pub(crate) fn check_pi() -> bool {
     print_check_items(&items)
 }
 
+/// Returns true when any item is `Missing` — see [`check_codex`].
+pub(crate) fn check_omp() -> bool {
+    let env =
+        OmpEnv { omp_on_path: which("omp"), zj_radar_on_path: which("zj-radar"), extension_text: omp_extension_text() };
+    let items = omp_check_items(&analyze_omp(&env));
+    println!("omp:");
+    print_check_items(&items)
+}
+
+pub(crate) fn omp_check_items(f: &OmpFacts) -> Vec<CheckItem> {
+    vec![
+        agent_binary_item("omp binary", f.omp_on_path, f.extension_is_ours == Some(true), "the bridge is installed"),
+        if f.zj_radar_on_path {
+            CheckItem::ok("zj-radar binary", "found on PATH")
+        } else {
+            CheckItem::missing("zj-radar binary", "not found on PATH")
+        },
+        match f.extension_is_ours {
+            // `omp` is in `AGENT_NAMES`: without the bridge its pane is dark.
+            None => CheckItem::missing(
+                "extension",
+                "zj-radar bridge extension not installed — omp panes stay dark until it is; run `zj-radar setup omp` and restart omp",
+            ),
+            Some(true) => CheckItem::ok("extension", "zj-radar bridge extension installed"),
+            Some(false) => CheckItem::warn(
+                "extension",
+                "zj-radar-omp.js present but not ours (no marker) — re-run `zj-radar setup omp --force` to replace it",
+            ),
+        },
+    ]
+}
+
 /// The agent-binary item for an instrumented agent. Missing from PATH is
 /// only `Missing` when our wiring (bridge, hooks, notify slot) isn't installed
 /// either: `setup` accepts a PATH-less (bun/Nix-run) agent, so with our wiring
@@ -461,6 +496,14 @@ pub(crate) fn codex_check_items(f: &CodexFacts, legacy_notify: bool) -> Vec<Chec
         // install read perma-Warn. (Legacy notify mode has no hooks to trust.)
         items.push(CheckItem::note("hook trust", CODEX_HOOK_TRUST_ADVICE));
     }
+    // Hooks AND legacy notify both run in the daemon when one is up.
+    match f.daemon {
+        CodexDaemon::Running => items.push(CheckItem::warn("app-server daemon", CODEX_DAEMON_RUNNING_ADVICE)),
+        CodexDaemon::AutoStartOff => {
+            items.push(CheckItem::ok("app-server daemon", "auto-start disabled; hooks run in each Codex pane"))
+        }
+        CodexDaemon::NotRunning => items.push(CheckItem::note("app-server daemon", CODEX_DAEMON_ADVICE)),
+    }
     items
 }
 
@@ -479,6 +522,7 @@ mod tests {
             zj_radar_on_path: true,
             config_text: Some("model = \"x\"\n".to_string()),
             hooks_text: Some(hooks.to_string()),
+            daemon_running: false,
         });
         let items = codex_check_items(&facts, false);
         assert!(items.contains(&CheckItem::ok("codex binary", "found on PATH")));
@@ -500,8 +544,13 @@ mod tests {
             o => panic!("{o:?}"),
         };
         let binary = |hooks_text: Option<String>, config_text: Option<String>, legacy: bool| {
-            let facts =
-                analyze_codex(&CodexEnv { codex_on_path: false, zj_radar_on_path: true, config_text, hooks_text });
+            let facts = analyze_codex(&CodexEnv {
+                codex_on_path: false,
+                zj_radar_on_path: true,
+                config_text,
+                hooks_text,
+                daemon_running: false,
+            });
             codex_check_items(&facts, legacy).into_iter().find(|i| i.name == "codex binary").unwrap().level
         };
         // All owned hook events installed → a PATH-less Codex is advice.
@@ -523,11 +572,36 @@ mod tests {
             zj_radar_on_path: true,
             config_text: Some("notify = [\"zj-radar\", \"notify\", \"codex\"]\n".to_string()),
             hooks_text: None,
+            daemon_running: false,
         });
         let items = codex_check_items(&facts, false);
         assert!(items.contains(&CheckItem::ok("legacy notify", "zj-radar owns Codex notify")), "{items:?}");
         assert!(items.iter().all(|i| i.level != CheckLevel::Missing), "{items:?}");
         assert!(items.iter().all(|i| i.name != "hooks.json"), "{items:?}");
+    }
+
+    #[test]
+    fn codex_check_grades_the_shared_app_server_daemon() {
+        let daemon_item = |config: Option<&str>, running: bool| {
+            let facts = analyze_codex(&CodexEnv {
+                codex_on_path: true,
+                zj_radar_on_path: true,
+                config_text: config.map(str::to_string),
+                hooks_text: None,
+                daemon_running: running,
+            });
+            let items = codex_check_items(&facts, false);
+            items.into_iter().find(|i| i.name == "app-server daemon").expect("always graded")
+        };
+        let off = "[features]\ndaemon_auto_start = false\n";
+        // Running beats the config switch: the TUI attaches to a live daemon
+        // whatever auto-start says.
+        assert_eq!(daemon_item(Some(off), true).level, CheckLevel::Warn);
+        assert_eq!(daemon_item(None, true).level, CheckLevel::Warn);
+        assert_eq!(daemon_item(Some(off), false).level, CheckLevel::Ok);
+        assert_eq!(daemon_item(Some("[features]\ndaemon_auto_start = true\n"), false).level, CheckLevel::Note);
+        assert_eq!(daemon_item(None, false).level, CheckLevel::Note, "a Note never fails the doctor");
+        assert_eq!(daemon_item(Some("not = [toml"), false).level, CheckLevel::Note);
     }
 
     #[test]
@@ -541,6 +615,7 @@ mod tests {
             zj_radar_on_path: true,
             config_text: Some("[features]\nhooks = false\n".to_string()),
             hooks_text: Some(hooks.to_string()),
+            daemon_running: false,
         });
         let items = codex_check_items(&facts, false);
         assert!(items.iter().any(|item| item.name == "hooks feature"
@@ -569,6 +644,7 @@ mod tests {
             zj_radar_on_path: true,
             config_text: None,
             hooks_text: Some(partial.to_string()),
+            daemon_running: false,
         });
         let items = codex_check_items(&facts, false);
         assert!(items.iter().any(|item| item.name == "hooks.json"
@@ -580,6 +656,7 @@ mod tests {
             zj_radar_on_path: true,
             config_text: None,
             hooks_text: Some("not json".to_string()),
+            daemon_running: false,
         });
         let items = codex_check_items(&facts, false);
         assert!(items.iter().any(|item| item.name == "hooks.json"
@@ -599,6 +676,7 @@ mod tests {
             zj_radar_on_path: true,
             config_text: Some(config.to_string()),
             hooks_text: Some(hooks.to_string()),
+            daemon_running: false,
         });
         let items = codex_check_items(&facts, false);
         assert!(items.iter().any(|item| item.name == "legacy notify"
@@ -613,6 +691,7 @@ mod tests {
             zj_radar_on_path: true,
             config_text: Some("notify = [\"zj-radar\", \"notify\", \"codex\"]\n".to_string()),
             hooks_text: None,
+            daemon_running: false,
         });
         let items = codex_check_items(&facts, true);
         assert!(items.contains(&CheckItem::ok("legacy notify", "zj-radar owns Codex notify")));
@@ -622,6 +701,7 @@ mod tests {
             zj_radar_on_path: true,
             config_text: Some("notify = [\"/other\"]\n".to_string()),
             hooks_text: None,
+            daemon_running: false,
         });
         let items = codex_check_items(&facts, true);
         assert!(items.iter().any(|item| item.name == "legacy notify"
@@ -975,7 +1055,7 @@ mod tests {
 
     #[test]
     fn bridge_agent_binary_off_path_is_a_warn_once_the_bridge_is_ours() {
-        // `setup pi|opencode` accept a PATH-less (bun/Nix) agent, so a working
+        // `setup pi|omp|opencode` accept a PATH-less (bun/Nix) agent, so a working
         // install without the binary on PATH must not fail `--check`.
         let pi = |ext: Option<&str>| {
             pi_check_items(&analyze_pi(&PiEnv {
@@ -989,6 +1069,19 @@ mod tests {
         assert!(!pi(Some(PI_EXTENSION_JS)).iter().any(|i| i.level == CheckLevel::Missing));
         assert_eq!(pi(None)[0].level, CheckLevel::Missing, "no binary AND no bridge is still Missing");
         assert_eq!(pi(Some("// theirs\n"))[0].level, CheckLevel::Missing, "a foreign file isn't our install");
+
+        let omp = |ext: Option<&str>| {
+            omp_check_items(&analyze_omp(&OmpEnv {
+                omp_on_path: false,
+                zj_radar_on_path: true,
+                extension_text: ext.map(str::to_string),
+            }))
+        };
+        assert_eq!(omp(Some(OMP_EXTENSION_JS))[0].level, CheckLevel::Warn);
+        assert!(!omp(Some(OMP_EXTENSION_JS)).iter().any(|i| i.level == CheckLevel::Missing));
+        assert_eq!(omp(None)[0].level, CheckLevel::Missing, "no binary AND no bridge is still Missing");
+        assert_eq!(omp(Some(PI_EXTENSION_JS))[0].level, CheckLevel::Missing, "pi's bridge isn't omp's install");
+        assert_eq!(omp(Some(PI_EXTENSION_JS))[2].level, CheckLevel::Warn, "pi's bridge under our name is foreign");
 
         let oc = |plugin: Option<&str>, tui: Option<&str>| {
             opencode_check_items(&analyze_opencode(&OpencodeEnv {
@@ -1030,6 +1123,7 @@ mod tests {
                     zj_radar_on_path: false,
                     config_text: None,
                     hooks_text: None,
+                    daemon_running: false,
                 }),
                 false,
             ),

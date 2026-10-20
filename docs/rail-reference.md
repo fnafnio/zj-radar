@@ -44,7 +44,7 @@
 **Status glyphs (plain):** `○` idle · `⠋` working *(spins ⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏; a running
 **server** or a connected **remote** session holds a steady `▸` instead —
 neither spins)* · `◆` needs-you · `●` done · `✗` error.
-**Kind marks:** `✳` claude · `❉` codex · `✺` opencode · `✴` pi · `✦` gemini · `$` command · `⚙` build ·
+**Kind marks:** `✳` claude · `❉` codex · `✺` opencode · `✴` pi · `✷` omp · `✦` gemini · `$` command · `⚙` build ·
 `⚗` test · `⇡` deploy · `❯` server · `⇄` remote · `⦿` other.
 
 **Width ruler (32):**
@@ -978,6 +978,32 @@ tab 1 "web"
  └ ● ⇄ ssh prod-db
 ```
 
+## AH. Zellij input mode on the footer (`show_mode`)
+
+**Render-derived.** With `show_mode true`, the tally line carries the current
+Zellij input mode flush right: `NORMAL` muted, every other mode (`LOCKED`,
+`PANE`, `TAB`, `RESIZE`, `MOVE`, `SCROLL`, `SEARCH`, `RENAME`, `SESSION`,
+`PROMPT`, `TMUX`) in the accent color. The tally keeps priority: the label
+shows only when it fits after the tally with at least one space between, and
+is otherwise omitted whole, never truncated. Same line, same click target,
+same footer height as §AB. The `mode <name>` directive sets the mode (default:
+none, as with `show_mode` off).
+
+```rail-input
+width 32
+height 6
+mode locked
+tab 1 "web"
+```
+```rail-expect
+ RADAR                        ·1
+════════════════════════════════
+ ○ 1 web
+
+────────────────────────────────
+0 working                 LOCKED
+```
+
 ---
 
 ## Open decisions
@@ -1009,12 +1035,13 @@ width <n>            # optional, default 32
 height <n>           # optional, default = enough to fit (no overflow)
 glyphs plain|nerd    # optional, default plain
 jump_hint            # optional; footer advertises `alt-[n] jump` (default hidden)
+mode <name>          # optional; footer shows that Zellij mode (default none, as show_mode off)
 tab <pos> "<name>" [active]
   <kind> <status> "<msg>" [task "<text>"] [waiting <N>m] [exit <N>|?]   # one line per pane, indented
   ...
 ```
 
-- `kind` ∈ claude·codex·opencode·pi·gemini·command·build·test·deploy·server·remote·other
+- `kind` ∈ claude·codex·opencode·pi·omp·gemini·command·build·test·deploy·server·remote·other
 - `status` ∈ running·pending·done·error·idle
 - `waiting <N>m` backdates the pane's waiting-on-you edge by N minutes so the
   `· Nm` wait tag renders (pending panes only; without it the pane applied

@@ -6,8 +6,9 @@ at the real docs rather than duplicating them.
 zj-radar is a [Zellij](https://zellij.dev) sidebar (Rust → `wasm32-wasip1`)
 plus a host-side `zj-radar` CLI and producer adapters for Claude Code (a
 bundled Claude plugin), Codex (hooks installed by `zj-radar setup codex`),
-Opencode (a JS bridge installed by `zj-radar setup opencode`), and pi (an
-extension installed by `zj-radar setup pi`).
+Opencode (a JS bridge installed by `zj-radar setup opencode`), pi (an
+extension installed by `zj-radar setup pi`), and omp, a pi fork (an
+extension installed by `zj-radar setup omp`).
 
 ## Read first
 
@@ -26,7 +27,7 @@ cargo build                                    # host library + CLI checks
 cargo build --release --target wasm32-wasip1 -p zj-radar-plugin   # the wasm plugin Zellij loads
 just test        # L1–L4 deterministic host suite (unit, insta, proptest, vt100)
 just test-bash   # bash hook tests (needs bats + shellcheck + jq)
-just test-js     # pi bridge extension tests (needs node)
+just test-js     # pi + omp bridge extension tests (needs node)
 just test-e2e    # L5 live: builds wasm, drives a real Zellij in a PTY (needs zellij)
 just fmt         # cargo fmt --all (rustfmt.toml)
 just ci          # what every PR must pass: fmt check + test + clippy + wasm build + test-bash + test-js
@@ -56,7 +57,8 @@ No wasm build is needed for typical work: the plugin's domain modules and
 The producer interface is the `zj_radar.status.v1` pipe payload. The plugin's
 other external contracts are the `zj_radar.cmd.v1` and `zj_radar.config.v1`
 pipes ([`docs/configuration.md`](docs/configuration.md)) and the presence-file
-format (`crates/plugin/src/presence.rs`). A new instrumented agent is an
+format ([`docs/producers.md`](docs/producers.md#presence-file-and-state---json)
+is the contract, `crates/core/src/presence.rs` the types). A new instrumented agent is an
 `enum Agent` variant in `crates/cli/src/agents/` plus `Agent::derive`; the
 `source_round_trips_through_kind` guard test lists what else to wire.
 Observed commands like `cargo test` are classified in

@@ -142,7 +142,7 @@ main() {
        printf '\n  export PATH="%s:$PATH"\n\n' "$BIN_DIR" ;;
   esac
 
-  say "next: 'zj-radar setup zellij --download' to install the sidebar, then 'zj-radar setup' to wire Codex (Claude Code: install the plugin from inside Claude — see the README)"
+  say "next: 'zj-radar setup zellij --download' to install the sidebar, then 'zj-radar setup' to wire every agent it finds (Claude Code, Codex, Opencode, pi, omp)"
 }
 
 # Test seam: scripts/tests/install.bats sources this file with

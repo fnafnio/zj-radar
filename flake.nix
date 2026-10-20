@@ -52,6 +52,8 @@
           || (pkgs.lib.hasSuffix "/crates/cli/src/setup/opencode_tui_plugin.js" path)
           # include_str!'d by the CLI's pi setup — the vendored bridge extension.
           || (pkgs.lib.hasSuffix "/crates/cli/src/setup/pi_extension.js" path)
+          # include_str!'d by the CLI's omp setup — the vendored bridge extension.
+          || (pkgs.lib.hasSuffix "/crates/cli/src/setup/omp_extension.js" path)
           # include_str!'d by the plugin's producer-script guard test (lib.rs).
           || (pkgs.lib.hasSuffix "/plugins/zj-radar-claude/scripts/notify.sh" path)
           # include_str!'d by the plugin's hook-headroom guard (hooks_manifest_tests.rs).

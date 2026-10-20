@@ -5,8 +5,8 @@
 
 use super::detect::pi_extension_is_ours;
 use super::vendored::{
-    dry_run_backup_line, kept_backup_line, plan_install, plan_uninstall, read_existing, remove_backup_if_ours,
-    write_bridge, Existing, InstallPlan, UninstallPlan,
+    dry_run_backup_line, kept_backup_line, plan_install, plan_uninstall, read_existing, refuse_if_managed,
+    remove_backup_if_ours, write_bridge, Existing, InstallPlan, UninstallPlan,
 };
 use super::*;
 
@@ -69,91 +69,115 @@ pub(crate) fn setup_pi(uninstall: bool, opts: BridgeSetupOpts) {
         return;
     };
     let existing = read_existing(&path);
-    let pi_on_path = which("pi");
     let override_set = std::env::var_os("PI_CODING_AGENT_DIR").is_some_and(|d| !d.is_empty());
     if !uninstall
-        && !pi_installed_from(pi_on_path, override_set, agent_dir.is_dir(), !matches!(existing, Existing::Absent))
+        && !pi_installed_from(which("pi"), override_set, agent_dir.is_dir(), !matches!(existing, Existing::Absent))
     {
-        println!("pi: skipped (binary/agent dir not found)");
-        return;
+        return report_skip("pi", "binary/agent dir not found", opts.explicit);
     }
-    let facts = analyze_pi(&PiEnv {
-        pi_on_path,
-        zj_radar_on_path: which("zj-radar"),
-        extension_text: existing.text().map(str::to_string),
-        pi_version: None,
-    });
+    setup_extension_file(
+        &ExtensionFile {
+            label: "pi",
+            path: &path,
+            js: PI_EXTENSION_JS,
+            is_ours: pi_extension_is_ours,
+            restart_hint: "restart pi (or run /reload)",
+        },
+        &existing,
+        uninstall,
+        opts,
+    );
+}
 
+/// One vendored single-file extension bridge (pi's, omp's): where it lives,
+/// what we write, and how we recognize ours.
+#[derive(Clone, Copy)]
+pub(super) struct ExtensionFile<'a> {
+    pub label: &'static str,
+    pub path: &'a std::path::Path,
+    pub js: &'static str,
+    pub is_ours: fn(&str) -> bool,
+    /// How the agent picks up a freshly written bridge.
+    pub restart_hint: &'static str,
+}
+
+/// Install or uninstall one extension bridge file — the shared body of
+/// `setup pi` and `setup omp` once the caller has resolved the path and
+/// gated on the agent being present.
+pub(super) fn setup_extension_file(ext: &ExtensionFile, existing: &Existing, uninstall: bool, opts: BridgeSetupOpts) {
+    let ExtensionFile { label, path, js, is_ours, restart_hint } = *ext;
     if uninstall {
-        match plan_uninstall(&existing, pi_extension_is_ours) {
-            UninstallPlan::Absent => println!("pi: extension not installed ({})", path.display()),
-            UninstallPlan::NotOurs => println!("pi: extension not ours (marker absent) — leaving {}", path.display()),
+        match plan_uninstall(existing, is_ours) {
+            UninstallPlan::Absent => println!("{label}: extension not installed ({})", path.display()),
+            UninstallPlan::NotOurs => {
+                println!("{label}: extension not ours (marker absent) — leaving {}", path.display())
+            }
+            UninstallPlan::Remove if refuse_if_managed(label, path, true) => {}
             UninstallPlan::Remove if opts.dry_run => {
                 println!("--- would remove {} (dry-run) ---", path.display());
-                if let Some(line) = dry_run_backup_line("pi", &path, pi_extension_is_ours) {
+                if let Some(line) = dry_run_backup_line(label, path, is_ours) {
                     println!("{line}");
                 }
             }
             UninstallPlan::Remove => {
                 if !confirm(&format!("Remove {}?", path.display()), opts.yes, opts.is_tty) {
-                    println!("pi: skipped (declined)");
+                    return report_declined(label, opts.is_tty, opts.explicit);
+                }
+                if let Err(e) = std::fs::remove_file(path) {
+                    crate::exit::fail_report(label, format!("remove failed — {e}"));
                     return;
                 }
-                if let Err(e) = std::fs::remove_file(&path) {
-                    crate::exit::fail_report("pi", format!("remove failed — {e}"));
-                    return;
-                }
-                println!("pi: extension removed ({})", path.display());
+                println!("{label}: extension removed ({})", path.display());
                 // Its restore point goes too when ours (a stale-ours rewrite); a
                 // foreign one — what `--force` replaced — is the user's only copy.
-                if let Some(bak) = remove_backup_if_ours(&path, pi_extension_is_ours) {
-                    println!("{}", kept_backup_line("pi", &bak, &path, false));
+                if let Some(bak) = remove_backup_if_ours(path, is_ours) {
+                    println!("{}", kept_backup_line(label, &bak, path, false));
                 }
             }
         }
         return;
     }
 
-    match plan_install(&existing, PI_EXTENSION_JS, opts.force, pi_extension_is_ours) {
+    match plan_install(existing, js, opts.force, is_ours) {
         InstallPlan::RefuseForeign => {
-            let why = existing.refusal_reason(&path);
+            let why = existing.refusal_reason(path);
             crate::exit::fail_report(
-                "pi",
+                label,
                 format!("{why}. Refusing to overwrite it.\nRe-run with --force to replace it."),
             );
         }
         InstallPlan::UpToDate => {
-            println!("pi: extension already up to date ({})", path.display());
-            print_pi_guidance(&facts, false);
+            println!("{label}: extension already up to date ({})", path.display());
+            print_extension_guidance(label, restart_hint, false);
         }
+        InstallPlan::Write if refuse_if_managed(label, path, false) => {}
         InstallPlan::Write if opts.dry_run => {
-            println!("--- {} (dry-run) ---\n{}", path.display(), PI_EXTENSION_JS);
-            print_pi_guidance(&facts, true);
+            println!("--- {} (dry-run) ---\n{}", path.display(), js);
+            print_extension_guidance(label, restart_hint, true);
         }
         InstallPlan::Write => {
             if !confirm(&format!("Write {}?", path.display()), opts.yes, opts.is_tty) {
-                println!("pi: skipped (declined)");
+                return report_declined(label, opts.is_tty, opts.explicit);
+            }
+            if let Err(e) = write_bridge(path, js, existing, is_ours) {
+                crate::exit::fail_report(label, format!("write failed — {e}"));
                 return;
             }
-            if let Err(e) = write_bridge(&path, PI_EXTENSION_JS, &existing, pi_extension_is_ours) {
-                crate::exit::fail_report("pi", format!("write failed — {e}"));
-                return;
-            }
-            println!("pi: extension installed ({})", path.display());
-            print_pi_guidance(&facts, true);
+            println!("{label}: extension installed ({})", path.display());
+            print_extension_guidance(label, restart_hint, true);
         }
     }
 }
 
-fn print_pi_guidance(facts: &PiFacts, wrote: bool) {
-    if !facts.zj_radar_on_path {
+fn print_extension_guidance(label: &str, restart_hint: &str, wrote: bool) {
+    if !which("zj-radar") {
         eprintln!(
-            "pi: warning — `zj-radar` not found on PATH; the bridge spawns it per event, \
+            "{label}: warning — `zj-radar` not found on PATH; the bridge spawns it per event, \
              so status won't broadcast until it's installed"
         );
     }
     if wrote {
-        println!("pi: restart pi (or run /reload) for the bridge to take effect.");
+        println!("{label}: {restart_hint} for the bridge to take effect.");
     }
 }
 

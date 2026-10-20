@@ -130,7 +130,7 @@ pub fn run(options: UpdateOptions) {
     }
     if cli_behind {
         // Re-wire only the producers already wired — a release may have changed
-        // the codex hook shape or the vendored opencode/pi bridges — never one
+        // the codex hook shape or the vendored opencode/pi/omp bridges — never one
         // the user hasn't chosen (bare `setup` would install for every agent on
         // PATH) — and each along the route it was wired by (a notify-only
         // Codex re-runs with `--legacy-notify`, never gaining hooks).

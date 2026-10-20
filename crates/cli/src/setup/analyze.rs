@@ -4,7 +4,7 @@ use crate::agents::Agent;
 use crate::producers::ProducerTexts;
 use crate::setup::detect::{
     codex_hook_handler_is_ours, has_unmanaged_radar_alias, is_unmanaged_radar_alias_line, notify_is_ours,
-    opencode_plugin_is_ours, pi_extension_is_ours, strip_managed_zellij_alias,
+    omp_extension_is_ours, opencode_plugin_is_ours, pi_extension_is_ours, strip_managed_zellij_alias,
 };
 
 use std::path::{Path, PathBuf};
@@ -159,12 +159,27 @@ pub(crate) fn zellij_version_is_supported(version_output: &str) -> bool {
 }
 
 /// Pure: derive every Zellij setup fact from already-read inputs. No I/O.
+/// `(managed, unmanaged)`: is our marked alias block in `config.kdl`, and is
+/// a `radar` alias of the user's own there outside it?
+fn alias_presence(lines: &[String]) -> (bool, bool) {
+    let managed = lines.iter().any(|l| l.trim() == ZELLIJ_ALIAS_BEGIN);
+    let mut lines_without_managed = lines.to_vec();
+    strip_managed_zellij_alias(&mut lines_without_managed);
+    (managed, has_unmanaged_radar_alias(&lines_without_managed))
+}
+
+/// Does `config.kdl` carry any `radar` alias, ours or the user's? The alias
+/// half of [`analyze_zellij`], for a caller that needs only "has the sidebar
+/// been set up at all" and not the doctor's full (spawning) read.
+pub(crate) fn radar_alias_present(config_text: Option<&str>) -> bool {
+    let lines: Vec<String> = config_text.map(split_lines).unwrap_or_default();
+    let (managed, unmanaged) = alias_presence(&lines);
+    managed || unmanaged
+}
+
 pub(crate) fn analyze_zellij(env: &ZellijEnv) -> ZellijFacts {
     let lines: Vec<String> = env.config_text.as_deref().map(split_lines).unwrap_or_default();
-    let managed_alias_present = lines.iter().any(|l| l.trim() == ZELLIJ_ALIAS_BEGIN);
-    let mut lines_without_managed = lines.clone();
-    strip_managed_zellij_alias(&mut lines_without_managed);
-    let unmanaged_alias_present = has_unmanaged_radar_alias(&lines_without_managed);
+    let (managed_alias_present, unmanaged_alias_present) = alias_presence(&lines);
     // Scoped to radar alias lines inside a plugins block: other plugins
     // legitimately live in the store (e.g. `room location="file:/nix/store/…"`)
     // and must not trip the radar grant-persistence warning — nor should a
@@ -198,6 +213,20 @@ pub(crate) enum CodexHooksFeature {
     ConfigError(String),
 }
 
+/// Derived state of Codex's shared app-server daemon, whose hooks carry a
+/// stale pane env and are therefore dropped by `notify codex` (issue #71).
+#[derive(Debug, PartialEq)]
+pub(crate) enum CodexDaemon {
+    /// Live now: every hook runs there, so Codex rows stay dark.
+    Running,
+    /// `[features].daemon_auto_start = false` and none running: hooks run
+    /// in each TUI with its own pane env.
+    AutoStartOff,
+    /// None running, auto-start not disabled: Codex 0.157+ starts one with
+    /// the next session.
+    NotRunning,
+}
+
 /// Derived state of the legacy `notify` slot in Codex `config.toml`.
 pub(crate) enum CodexNotifyState {
     ConfigAbsent,
@@ -213,6 +242,8 @@ pub(crate) struct CodexEnv {
     pub zj_radar_on_path: bool,
     pub config_text: Option<String>,
     pub hooks_text: Option<String>,
+    /// A Codex app-server daemon is live (`codex_daemon::daemon_running`).
+    pub daemon_running: bool,
 }
 
 /// Every derived fact about Codex setup state. The legacy-vs-hooks choice is a
@@ -224,6 +255,7 @@ pub(crate) struct CodexFacts {
     pub notify: CodexNotifyState,
     /// `None` = hooks.json absent; `Some(Ok(n))` = n marker-owned events; `Some(Err)` = parse error.
     pub owned_hook_events: Option<Result<usize, String>>,
+    pub daemon: CodexDaemon,
 }
 
 /// Pure: derive every Codex setup fact from already-read inputs. No I/O.
@@ -243,12 +275,20 @@ pub(crate) fn analyze_codex(env: &CodexEnv) -> CodexFacts {
         },
     };
     let owned_hook_events = env.hooks_text.as_deref().map(codex_owned_hook_event_count);
+    let daemon = if env.daemon_running {
+        CodexDaemon::Running
+    } else if env.config_text.as_deref().is_some_and(codex_daemon_auto_start_off) {
+        CodexDaemon::AutoStartOff
+    } else {
+        CodexDaemon::NotRunning
+    };
     CodexFacts {
         codex_on_path: env.codex_on_path,
         zj_radar_on_path: env.zj_radar_on_path,
         hooks_feature,
         notify,
         owned_hook_events,
+        daemon,
     }
 }
 
@@ -271,6 +311,18 @@ fn codex_hooks_disabled_in_config(existing: &str) -> Result<bool, String> {
         .and_then(Item::as_table_like)
         .and_then(|features| features.get("hooks").or_else(|| features.get("codex_hooks")).and_then(Item::as_bool))
         == Some(false))
+}
+
+/// `[features].daemon_auto_start = false`? Unparseable TOML reads as not set
+/// (the hooks-feature item already reports the parse error).
+fn codex_daemon_auto_start_off(existing: &str) -> bool {
+    existing.parse::<DocumentMut>().ok().is_some_and(|doc| {
+        doc.get("features")
+            .and_then(Item::as_table_like)
+            .and_then(|features| features.get("daemon_auto_start"))
+            .and_then(Item::as_bool)
+            == Some(false)
+    })
 }
 
 /// Raw, already-read environment for opencode setup. The only IO layer.
@@ -338,6 +390,30 @@ pub(crate) fn analyze_pi(env: &PiEnv) -> PiFacts {
         zj_radar_on_path: env.zj_radar_on_path,
         extension_is_ours: env.extension_text.as_deref().map(pi_extension_is_ours),
         pi_version: env.pi_version.as_deref().and_then(parse_semver),
+    }
+}
+
+pub(crate) struct OmpEnv {
+    pub omp_on_path: bool,
+    pub zj_radar_on_path: bool,
+    pub extension_text: Option<String>,
+}
+
+/// omp's doctor facts. No version floor: the bridge degrades on an older omp
+/// (no subagent identity → all sessions read as main; no approval events →
+/// approvals don't surface) rather than breaking.
+pub(crate) struct OmpFacts {
+    pub omp_on_path: bool,
+    pub zj_radar_on_path: bool,
+    /// `None` = absent; `Some(true)` = ours; `Some(false)` = foreign.
+    pub extension_is_ours: Option<bool>,
+}
+
+pub(crate) fn analyze_omp(env: &OmpEnv) -> OmpFacts {
+    OmpFacts {
+        omp_on_path: env.omp_on_path,
+        zj_radar_on_path: env.zj_radar_on_path,
+        extension_is_ours: env.extension_text.as_deref().map(omp_extension_is_ours),
     }
 }
 
@@ -507,6 +583,7 @@ mod tests {
                 zj_radar_on_path: true,
                 config_text: cfg.map(str::to_string),
                 hooks_text: None,
+                daemon_running: false,
             })
         };
         assert!(matches!(mk(Some(ours)).notify, CodexNotifyState::Ours));
@@ -523,6 +600,7 @@ mod tests {
             zj_radar_on_path: true,
             config_text: Some(cfg_disabled.to_string()),
             hooks_text: None,
+            daemon_running: false,
         });
         assert!(matches!(f.hooks_feature, CodexHooksFeature::Disabled));
         assert!(f.owned_hook_events.is_none(), "no hooks.json -> None");

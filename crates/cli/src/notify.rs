@@ -97,6 +97,19 @@ pub fn run(agent: &str, input: Option<&str>, status_arg: Option<&str>, dry_run: 
     let Some(update) = agent.derive(&Intake { raw: &raw, status_arg }) else {
         return;
     };
+    // A hook run by Codex's shared app-server daemon carries the env of
+    // whichever pane started the daemon, so `pane_id` names the wrong pane.
+    // Drop it: a dark row beats a stranger's status (`codex_daemon`). Checked
+    // after derive so hooks that send nothing never walk the process tree.
+    if agent == Agent::Codex && crate::codex_daemon::hook_runs_in_app_server() {
+        if dry_run {
+            eprintln!(
+                "zj-radar: this hook runs in Codex's shared app-server daemon, whose pane env is stale — \
+                 nothing would be broadcast (launch codex with --no-daemon; see docs/troubleshooting.md)"
+            );
+        }
+        return;
+    }
 
     broadcast(pane_id, update, agent.source(), dry_run);
 }
@@ -262,7 +275,7 @@ fn send_with(payload: &str, timeout: std::time::Duration, path: Option<&std::ffi
 /// `RUNNING_PIPE_TIMEOUT_SECS`, while the once-per-turn edges keep the full
 /// `DEFAULT_PIPE_TIMEOUT_SECS` — dropping an edge loses real state. Keying
 /// the default here (instead of per-entry env prefixes in hooks.json) gives
-/// every producer — claude, codex, opencode, pi, generic — the policy from one seam.
+/// every producer — claude, codex, opencode, pi, omp, generic — the policy from one seam.
 /// Clamped to an hour so `timeout + 1 s` (the send's backstop) cannot
 /// overflow `Duration` — this module promises the calling hook never sees
 /// a panic.
